@@ -45,7 +45,6 @@ No real distributed communication happens at pass time: collectives are
 inserted as FX nodes only, so ``torch.distributed`` is mocked throughout.
 """
 
-import os
 import unittest
 from contextlib import contextmanager
 from typing import Iterator
@@ -493,6 +492,21 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 f"got {_count_targets(gm, 'reduce_scatter_tensor')}"
             ),
         )
+
+    def test_run_rejects_non_divisible_expert_param(self):
+        """Do not silently replicate an unsynchronized trainable expert."""
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=4)
+        gm = _odd_joint_graph()
+        model = _OddParam()
+        model.odd = nn.Parameter(torch.zeros(2, 4))
+        with _patch_dist(world_size=4, rank=0, initialized=True):
+            with self.assertRaisesRegex(ValueError, "edp_shard degree 4"):
+                FSDPPass().run(
+                    gm, cfg, model=model, fsdp_group_name="fsdp",
+                    expert_param_names={"odd"}, expert_fsdp_group_name="fsdp_expert",
+                )
+        self.assertEqual(tuple(model.odd.shape), (2, 4))
+        self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
 
     def test_run_uses_fsdp_degree_from_config_not_world_size(self):
         """Test ``fsdp_degree`` from the config wins over ``world_size``.

@@ -116,6 +116,17 @@ class TestPassConfigDefaults(unittest.TestCase):
         self.assertEqual(cfg.pp_microbatch_size, 2)
         self.assertEqual(cfg.pp_schedule, "1f1b")
 
+    def test_legacy_positional_arguments_keep_reshard_setting(self):
+        """Adding EP must preserve the original third positional argument."""
+        cfg = PassConfig(True, False, False)
+        self.assertTrue(cfg.enable_overlap)
+        self.assertFalse(cfg.fsdp_enabled)
+        self.assertFalse(cfg.fsdp_reshard_after_forward)
+        self.assertFalse(cfg.ep_enabled)
+        ep_cfg = PassConfig(True, False, False, ep_enabled=True)
+        self.assertTrue(ep_cfg.ep_enabled)
+        self.assertFalse(ep_cfg.fsdp_reshard_after_forward)
+
 
 class TestPassConfigDpMode(unittest.TestCase):
     """``dp_mode`` canonicalization + validation (simplefsdp parity)."""

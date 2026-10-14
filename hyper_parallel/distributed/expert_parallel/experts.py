@@ -35,6 +35,7 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 import logging
 import math
 import os
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional
 import torch
@@ -62,12 +63,30 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all_async,
     wait_ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.dispatch_contract import ExpertBatch
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
 )
 
 
 logger = logging.getLogger(__name__)
+_GRAPH_ROUTED_FORWARD: ContextVar[Optional[Callable]] = ContextVar(
+    "graph_ep_routed_forward", default=None
+)
+_GRAPH_ROUTING_PREFLIGHT: ContextVar[Optional[Callable]] = ContextVar(
+    "graph_ep_routing_preflight", default=None
+)
+
+
+def _set_graph_routed_forward(routed_forward: Callable, routing_preflight: Callable) -> tuple[Token, Token]:
+    """Select a graph route and its error agreement for this trace context."""
+    return _GRAPH_ROUTED_FORWARD.set(routed_forward), _GRAPH_ROUTING_PREFLIGHT.set(routing_preflight)
+
+
+def _reset_graph_routed_forward(tokens: tuple[Token, Token]) -> None:
+    """Restore eager routing and preflight after graph capture."""
+    _GRAPH_ROUTING_PREFLIGHT.reset(tokens[1])
+    _GRAPH_ROUTED_FORWARD.reset(tokens[0])
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,84 @@ def resolve_swiglu_weights(
             "w1/w2/w3 three-matrix layouts); use an EP-aware MoE module instead"
         )
     return w_gate, w_up, w_down
+
+
+def swiglu_expert_forward(
+    experts: Any,
+    states: torch.Tensor,
+    index: int,
+    weights: tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Apply one stacked SwiGLU expert for eager and graph EP routing."""
+    gate_weight, up_weight, down_weight = weights
+    if up_weight is None:
+        gate_up_states = F.linear(  # pylint: disable=not-callable
+            states, gate_weight[index]
+        )
+        apply_gate = getattr(experts, "_ep_apply_gate", None)
+        if apply_gate is None:
+            gate_states, up_states = gate_up_states.chunk(2, dim=-1)
+            activation = getattr(experts, "_ep_act_fn", F.silu)
+            activated_states = activation(gate_states) * up_states
+        else:
+            activated_states = apply_gate(gate_up_states)
+    else:
+        gate_states = F.linear(  # pylint: disable=not-callable
+            states, gate_weight[index]
+        )
+        up_states = F.linear(  # pylint: disable=not-callable
+            states, up_weight[index]
+        )
+        activation = getattr(experts, "_ep_act_fn", F.silu)
+        activated_states = activation(gate_states) * up_states
+    return F.linear(  # pylint: disable=not-callable
+        activated_states, down_weight[index]
+    )
+
+
+def compute_expert_major(
+    experts: Any,
+    batch: ExpertBatch,
+) -> torch.Tensor:
+    """Compute contiguous expert groups using the common SwiGLU implementation.
+
+    Args:
+        experts: Stacked local SwiGLU weights and activation configuration.
+        batch: Expert-major input and exclusive end offsets.
+
+    Returns:
+        Expert-major output with the same shape as ``batch.tokens``.
+
+    Note:
+        Graph routing supplies Python shape offsets, so tracing does not read
+        a runtime tensor on the host. Eager routing reads its dynamic tensor
+        offsets once, as its existing split already requires.
+    """
+    if batch.tokens.ndim != 2:
+        raise ValueError("ExpertBatch requires [rows, hidden] tokens")
+    if experts.local_expert_count <= 0:
+        raise ValueError("ExpertBatch requires at least one local expert")
+    if isinstance(batch.offsets, torch.Tensor):
+        if batch.offsets.ndim != 1:
+            raise ValueError("ExpertBatch tensor offsets must be one-dimensional")
+        ends = batch.offsets.tolist()
+    elif isinstance(batch.offsets, tuple):
+        ends = batch.offsets
+    else:
+        raise ValueError("ExpertBatch offsets must be a tensor or a tuple of integers")
+    if len(ends) != experts.local_expert_count or ends[-1] != batch.tokens.shape[0]:
+        raise ValueError("ExpertBatch offsets do not cover the local expert rows")
+    if any(not isinstance(end, int) or isinstance(end, bool) for end in ends):
+        raise ValueError("ExpertBatch offsets must contain integers")
+    if any(end < start for start, end in zip((0, *ends[:-1]), ends)):
+        raise ValueError("ExpertBatch offsets must be monotonic")
+    weights = resolve_swiglu_weights(experts)
+    outputs = []
+    start = 0
+    for index, end in enumerate(ends):
+        outputs.append(swiglu_expert_forward(experts, batch.tokens[start:end], index, weights))
+        start = end
+    return torch.cat(outputs, dim=0)
 
 
 # ``ArgSort`` has no int32/int64 AICore kernel and silently falls back to
@@ -244,45 +341,8 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         output[token_order] = sorted_output
         return output
 
-    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
-    # The eager path needs host ints: read them in one transfer rather than
-    # draining the queue once per local expert.
-    expert_token_counts = local_expert_counts.tolist()
-    sorted_outputs = []
-    token_start = 0
-    for local_expert_index in range(experts.local_expert_count):
-        expert_token_count = expert_token_counts[local_expert_index]
-        expert_states = sorted_states[token_start:token_start + expert_token_count]
-        if up_weight is None:
-            gate_up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            )
-            apply_gate = getattr(experts, "_ep_apply_gate", None)
-            if apply_gate is None:
-                gate_states, up_states = gate_up_states.chunk(2, dim=-1)
-                activation = getattr(experts, "_ep_act_fn", F.silu)
-                activated_states = activation(gate_states) * up_states
-            else:
-                activated_states = apply_gate(gate_up_states)
-        else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
-            activation = getattr(experts, "_ep_act_fn", F.silu)
-            activated_states = activation(gate_states) * up_states
-        sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activated_states,
-                down_weight[local_expert_index],
-            )
-        )
-        token_start += expert_token_count
-
-    sorted_output = torch.cat(sorted_outputs)
+    batch = ExpertBatch(sorted_states, local_expert_counts.cumsum(dim=0))
+    sorted_output = compute_expert_major(experts, batch)
     output = torch.empty_like(sorted_output)
     output[token_order] = sorted_output
     return output
@@ -1058,6 +1118,11 @@ def ep_routed_forward(
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
+    graph_route = _GRAPH_ROUTED_FORWARD.get()
+    if graph_route is not None:
+        topk_indices, topk_weights = router_fn(module, hidden_states)
+        return graph_route(module.experts, hidden_states, topk_indices, topk_weights, ep_group)
+
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
     local_expert_count = module.experts.local_expert_count
@@ -1256,6 +1321,11 @@ def ep_routed_dispatch(
         The pending :class:`EPRoutedState` to hand to
         :func:`ep_routed_experts_and_combine`.
     """
+    graph_preflight = _GRAPH_ROUTING_PREFLIGHT.get()
+    if graph_preflight is not None:
+        error = "Graph EP does not support split dispatch with overlap_shared_expert=True"
+        graph_preflight(ep_group, error)
+        raise ValueError(error)
     ep_size = ep_group.size()
     local_expert_count = module.experts.local_expert_count
     global_expert_count = local_expert_count * ep_size
