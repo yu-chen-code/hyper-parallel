@@ -75,6 +75,9 @@ class PassConfig:
             for pure-TP / pure-PP graph-mode runs. ``FSDPPass`` itself still
             early-returns when distributed is not initialized or
             ``world_size == 1``, so single-card runs are a no-op regardless.
+        ep_enabled: Capture the explicitly selected fixed-slot EP backend.
+            Supports pure EP and supported FSDP+EP configurations; dispatcher
+            selection remains unchanged.
         fsdp_reshard_after_forward: Drive the FSDP reshard optimization.
             When ``True`` (default, matching FSDP's ``reshard_after_forward``)
             ``FSDPPass`` sinks each param's all_gather to its first forward
@@ -161,6 +164,7 @@ class PassConfig:
     pp_degree: Optional[int] = None
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    ep_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -177,6 +181,7 @@ class PassConfig:
         """
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
+        self._validate_ep_mode()
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
             raise ValueError(
                 f"fsdp_degree must be None or a positive int, got {self.fsdp_degree}"
@@ -205,6 +210,21 @@ class PassConfig:
             raise ValueError(
                 f"pp_schedule must be one of {PP_SCHEDULES}, got {self.pp_schedule!r}"
             )
+
+    def _validate_ep_mode(self) -> None:
+        """Limit graph EP to pure EP or FSDP plus EP."""
+        if not self.ep_enabled:
+            return
+        mixed_axes = (
+            self.pp_enabled,
+            self.tp_size != 1,
+            self.sequence_parallel,
+            self.loss_parallel,
+        )
+        if any(mixed_axes):
+            raise ValueError("Graph EP supports only pure EP or FSDP+EP without TP/PP/SP/LP")
+        if self.fsdp_enabled and self.dp_mode != "fsdp":
+            raise ValueError("Graph FSDP+EP currently requires dp_mode='fsdp'")
 
 
 def build_pass_config_from_trainer_config(

@@ -214,3 +214,7 @@
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "unused-argument"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "protected-access"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "possibly-used-before-assignment"
+
+# EP/CSA: PyTorch C-extension linear/bmm callables are unresolved by pylint.
+"hyper-parallel/hyper_parallel/distributed/expert_parallel/experts.py" "not-callable"
+"hyper-parallel/tests/ut/compile/test_expert_parallel.py" "not-callable"

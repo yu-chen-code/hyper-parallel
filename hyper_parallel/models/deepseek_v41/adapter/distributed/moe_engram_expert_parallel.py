@@ -120,6 +120,8 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Any,
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
+        dispatcher_backend: str = "dynamic",
+        validation_mode: str = "strict",
 ) -> Callable:
     """Build the complete V4.1 routed-plus-shared expert forward."""
     del mesh, cp_mesh
@@ -140,11 +142,18 @@ def deepseek_v41_ep_compute_fn(
     ep_group = ep_mesh.get_group("ep")
     tp_size = 1 if tp_mesh is None else tp_mesh.size()
     tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
+    dispatcher_options = (
+        {"dispatcher_backend": dispatcher_backend, "ep_group": ep_group}
+        if dispatcher_backend != "dynamic" else {}
+    )
+    if dispatcher_backend != "dynamic" and validation_mode != "strict":
+        dispatcher_options["validation_mode"] = validation_mode
     bind_local_expert_forward(
         module,
         ep_mesh["ep"].size(),
         use_grouped_gemm=use_grouped_gemm,
         apply_gate=None if use_grouped_gemm else apply_gate,
+        **dispatcher_options,
     )
 
     if "image_mask" not in inspect.signature(module.forward).parameters:
