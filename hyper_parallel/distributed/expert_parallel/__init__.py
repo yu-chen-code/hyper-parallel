@@ -25,15 +25,21 @@ components/distributed/ep_compute.py + ep_utils.py in stage 4e.
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.dispatch_contract import (
+    DispatchMetadata, DispatchPlan, DispatchResult, ExpertBatch, RoutingResult, TokenDispatcher,
+)
+from hyper_parallel.distributed.expert_parallel.dispatchers import FixedSlotTokenDispatcher
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
+    compute_expert_major,
     describe_moe_module,
     ep_routed_forward,
     require_attrs,
     resolve_swiglu_weights,
+    swiglu_expert_forward,
 )
 from hyper_parallel.distributed.expert_parallel.recipes import (
     EP_ARCHETYPE_SUGGESTIONS,
@@ -48,9 +54,17 @@ from hyper_parallel.distributed.expert_parallel.recipes import (
 __all__ = [
     "EP_ARCHETYPES",
     "EP_ARCHETYPE_SUGGESTIONS",
+    "ExpertBatch",
+    "RoutingResult",
+    "DispatchMetadata",
+    "DispatchPlan",
+    "DispatchResult",
+    "TokenDispatcher",
+    "FixedSlotTokenDispatcher",
     "MOE_ROUTER_ADAPTERS",
     "bind_local_expert_forward",
     "build_ep_compute",
+    "compute_expert_major",
     "deepseekv3_ep_compute_fn",
     "describe_moe_module",
     "ep_all_to_all",
@@ -59,5 +73,6 @@ __all__ = [
     "qwen2moe_ep_compute_fn",
     "require_attrs",
     "resolve_swiglu_weights",
+    "swiglu_expert_forward",
     "routed_only_ep_compute_fn",
 ]

@@ -54,6 +54,8 @@ Usage Example:
 """
 
 from .compiler import GraphCompiler
+from .expert_parallel import ep_all_to_all as graph_ep_all_to_all
+from .expert_parallel import routed_forward as graph_ep_routed_forward
 
 from .graph_parallel_plan import (
     GraphParallelPlan,
@@ -74,6 +76,8 @@ __all__ = [
     "PassConfig",
     # Compiler (compile + forward_backward only)
     "GraphCompiler",
+    "graph_ep_all_to_all",
+    "graph_ep_routed_forward",
     # Trainer
     "GraphTrainer",
 ]

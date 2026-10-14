@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 
@@ -142,11 +142,13 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
     capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
+    dispatcher_backend: str = "dynamic",
+    validation_mode: str = "strict",
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -170,16 +172,14 @@ def build_ep_compute(
     """
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
-    if use_grouped_gemm:
-        bind_local_expert_forward(
-            module,
-            ep_mesh["ep"].size(),
-            use_grouped_gemm=True,
-        )
-    else:
-        # Keep the established call contract unchanged for every reference
-        # archetype and for Qwen3 when grouped GEMM is disabled.
-        bind_local_expert_forward(module, ep_mesh["ep"].size())
+    options = {"use_grouped_gemm": True} if use_grouped_gemm else {}
+    if dispatcher_backend != "dynamic":
+        if overlap_fn is not None:
+            raise ValueError("fixed_slot does not support shared-expert overlap")
+        options.update(dispatcher_backend=dispatcher_backend, ep_group=ep_group)
+        if validation_mode != "strict":
+            options["validation_mode"] = validation_mode
+    bind_local_expert_forward(module, ep_mesh["ep"].size(), **options)
 
     if capacity_factor is not None:
         # Read back by ``experts._resolve_capacity_factor``; bounds each expert's routed slots

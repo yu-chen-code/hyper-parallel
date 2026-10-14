@@ -35,7 +35,9 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 import logging
 import math
 import os
-from dataclasses import dataclass
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, replace
+from itertools import accumulate
 from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.distributed as dist
@@ -62,12 +64,29 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all_async,
     wait_ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.dispatch_contract import (
+    DispatchPlan, ExpertBatch, RoutingResult, TokenDispatcher,
+)
+from hyper_parallel.distributed.expert_parallel.dispatchers import (
+    FixedSlotTokenDispatcher, reject_routing, routing_preflight,
+)
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
 )
 
 
 logger = logging.getLogger(__name__)
+_GRAPH_EP_CAPTURE: ContextVar[Optional[Any]] = ContextVar("graph_ep_capture", default=None)
+
+
+def _set_graph_ep_capture(context: Any) -> Token:
+    """Install the compile-owned capture context without a reverse import."""
+    return _GRAPH_EP_CAPTURE.set(context)
+
+
+def _reset_graph_ep_capture(token: Token) -> None:
+    """Restore the surrounding capture or eager execution context."""
+    _GRAPH_EP_CAPTURE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,260 @@ def resolve_swiglu_weights(
             "w1/w2/w3 three-matrix layouts); use an EP-aware MoE module instead"
         )
     return w_gate, w_up, w_down
+
+
+def _expert_weight_shapes(weights: tuple) -> tuple:
+    """Record logical weight metadata without retaining parameter tensors."""
+    return tuple(None if weight is None else tuple(weight.shape) for weight in weights)
+
+
+def _validate_swiglu_shapes(shapes: tuple, local_count: int, width: int) -> None:
+    """Validate logical dimensions independently of FSDP's physical storage."""
+    gate, up, down = shapes
+    for shape in shapes:
+        if shape is None:
+            continue
+        if len(shape) != 3:
+            raise ValueError("Graph EP expert weights must be rank-3 stacked tensors")
+        if shape[0] != local_count:
+            raise ValueError("Graph EP expert weights must match local_expert_count")
+    if gate[-1] != width or down[1] != width:
+        raise ValueError("Graph EP expert input/output width must match hidden states")
+    if up is None:
+        if gate[1] != 2 * down[-1]:
+            raise ValueError("Graph EP fused gate/up width must be twice the down-projection input width")
+    elif gate != up or gate[1] != down[-1]:
+        raise ValueError("Graph EP separate gate/up weights must match the down-projection input width")
+
+
+def _expert_mixed_precision(experts: Any) -> tuple:
+    """Read declared hook casts without materializing or retaining parameters."""
+    scheduler = getattr(experts, "hsdp_scheduler", None)
+    if scheduler is not None:
+        return getattr(scheduler, "mp_policy", None), getattr(scheduler, "device", None)
+    get_state = getattr(experts, "_get_fsdp_state", None)
+    state = get_state() if callable(get_state) else None
+    group = getattr(state, "_fsdp_param_group", None)
+    return getattr(group, "mp_policy", None), getattr(group, "device", None)
+
+
+def _expert_compute_device(weight: torch.Tensor, declared_device: Any) -> torch.device:
+    """Resolve an unindexed declared target using its resident parameter device."""
+    if declared_device is None:
+        return weight.device
+    device = torch.device(declared_device)
+    if device.type == weight.device.type and (device.index is None or device.type == "cpu"):
+        return weight.device
+    return device
+
+
+def _expert_compute_dtype(experts: Any, hidden: torch.Tensor, weights: tuple) -> torch.dtype:
+    """Validate device/linear dtype contracts, including declared hook casts."""
+    policy, materialized_device = _expert_mixed_precision(experts)
+    param_dtype = getattr(policy, "param_dtype", None)
+    cast_inputs = getattr(policy, "cast_forward_inputs", False) and param_dtype is not None
+    input_dtype = param_dtype if cast_inputs else hidden.dtype
+    autocast = torch.is_autocast_enabled(hidden.device.type)
+    low_precision = (torch.float16, torch.bfloat16, torch.float32)
+    output_dtype = input_dtype
+    for weight in weights:
+        if weight is None:
+            continue
+        if _expert_compute_device(weight, materialized_device) != hidden.device:
+            raise ValueError("EP expert weights and hidden states must use the same compute device")
+        dtype = param_dtype if param_dtype is not None else weight.dtype
+        eligible = autocast and input_dtype in low_precision and dtype in low_precision
+        if not weight.is_floating_point() or (dtype != input_dtype and not eligible):
+            raise ValueError("EP expert compute dtype must match hidden states or an active mixed-precision policy")
+        if eligible:
+            output_dtype = torch.get_autocast_dtype(hidden.device.type)
+    return getattr(policy, "output_dtype", None) or output_dtype
+
+
+def validate_expert_layout(experts: Any, hidden: torch.Tensor) -> tuple:
+    """Validate the logical expert and compute contracts before token exchange.
+
+    Args:
+        experts: Bound stacked SwiGLU holder, optionally managed by FSDP hooks.
+        hidden: Local floating-point tokens supplied to dispatch.
+
+    Returns:
+        Current gate/up/down references for capture-time parameter naming only.
+
+    Raises:
+        ValueError: If shapes, devices or compute dtypes are incompatible.
+        NotImplementedError: If the holder has no supported SwiGLU weights.
+    """
+    weights = resolve_swiglu_weights(experts)
+    if any(not isinstance(weight, torch.Tensor) for weight in weights if weight is not None):
+        raise ValueError("Graph EP expert weights must be tensors")
+    managed = hasattr(experts, "hsdp_scheduler") or hasattr(experts, "_get_fsdp_state")
+    shapes = getattr(experts, "ep_weight_shapes", None) if managed else None
+    if shapes is None:
+        shapes = _expert_weight_shapes(weights)
+    _validate_swiglu_shapes(shapes, experts.local_expert_count, hidden.shape[-1])
+    _expert_compute_dtype(experts, hidden, weights)
+    return weights
+
+
+def execute_routed_experts(experts: Any, hidden: torch.Tensor, router: Callable,
+                           dispatcher: TokenDispatcher, group: Any) -> torch.Tensor:
+    """Run the shared prepared dispatch, module compute and combine pipeline.
+
+    Args:
+        experts: Bound holder called through its module/FSDP hooks.
+        hidden: Tokens with the static shape agreed by EP participants.
+        router: Callback producing this invocation's RoutingResult.
+        dispatcher: Backend selected at binding, unchanged during capture.
+        group: EP participants, identical to the bound dispatcher's group.
+
+    Returns:
+        Router-weighted local output with the input token shape.
+
+    Raises:
+        ValueError: On incompatible preparation; strict/capture mode shares
+            local failures before data exchange. Local mode raises locally.
+    """
+    capture = _GRAPH_EP_CAPTURE.get()
+
+    def prepare() -> DispatchPlan:
+        """Prepare Router and logical expert contracts before peer agreement."""
+        if dispatcher.group is not group:
+            raise ValueError("EP dispatcher group differs from the bound group")
+        if capture is not None and not dispatcher.supports_graph_capture:
+            raise ValueError("Selected EP dispatcher does not support graph capture")
+        routing = router()
+        plan = dispatcher.prepare(hidden, routing)
+        if getattr(experts, "num_experts", plan.signature[1]) != plan.signature[1]:
+            raise ValueError("Graph EP expert count conflicts with the eager binder's local_expert_count")
+        weights = validate_expert_layout(experts, hidden)
+        output_dtype = _expert_compute_dtype(experts, hidden, weights)
+        if capture is not None:
+            capture.record_weights(weights)
+        return replace(plan, signature=(*plan.signature, hidden.device.type, str(output_dtype)))
+
+    if capture is not None:
+        plan = capture.preflight(group, prepare)
+    elif getattr(dispatcher, "validation_mode", "strict") == "strict":
+        plan = routing_preflight(group, prepare)
+    else:
+        plan = prepare()
+    result = dispatcher.dispatch(hidden, plan)
+    output = experts(result.batch.tokens, offsets=result.batch.offsets)
+    return dispatcher.combine(output, result.metadata)
+
+
+def fixed_slot_routed_forward(experts: Any, hidden: torch.Tensor, routing: RoutingResult,
+                              group: Any) -> torch.Tensor:
+    """Execute an explicitly requested fixed-slot route through the common pipeline.
+
+    Args:
+        experts: Bound stacked holder, or a compatible bare SwiGLU holder.
+        hidden: Floating-point local tokens with a trailing hidden dimension.
+        routing: Local Top-K IDs and Router weights.
+        group: EP participants entering this call in the same order.
+
+    Returns:
+        Router-weighted local output with the input token shape.
+
+    Raises:
+        ValueError: On any peer's incompatible routing or expert contract.
+    """
+    if not hasattr(experts, "token_dispatcher"):
+        _install_bound_forward(experts, _local_swiglu_expert_forward)
+    dispatcher = FixedSlotTokenDispatcher(group, getattr(experts, "local_expert_count", 0))
+    return execute_routed_experts(experts, hidden, lambda: routing, dispatcher, group)
+
+
+def swiglu_expert_forward(
+    experts: Any,
+    states: torch.Tensor,
+    index: int,
+    weights: tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Apply one stacked SwiGLU expert for eager and graph EP routing.
+
+    Args:
+        experts: Holder of the configured activation or custom fused gate.
+        states: This expert's contiguous [rows, hidden] input.
+        index: Local expert index in the stacked weights.
+        weights: Materialized gate/up/down tensors; up is None for fused gate/up.
+
+    Returns:
+        Expert output with the same row count and hidden width as states.
+    """
+    gate_weight, up_weight, down_weight = weights
+    if up_weight is None:
+        gate_up_states = F.linear(
+            states, gate_weight[index]
+        )
+        apply_gate = getattr(experts, "_ep_apply_gate", None)
+        if apply_gate is None:
+            gate_states, up_states = gate_up_states.chunk(2, dim=-1)
+            activation = getattr(experts, "_ep_act_fn", F.silu)
+            activated_states = activation(gate_states) * up_states
+        else:
+            activated_states = apply_gate(gate_up_states)
+    else:
+        gate_states = F.linear(
+            states, gate_weight[index]
+        )
+        up_states = F.linear(
+            states, up_weight[index]
+        )
+        activation = getattr(experts, "_ep_act_fn", F.silu)
+        activated_states = activation(gate_states) * up_states
+    return F.linear(
+        activated_states, down_weight[index]
+    )
+
+
+def compute_expert_major(
+    experts: Any,
+    batch: ExpertBatch,
+    weights: Optional[tuple] = None,
+) -> torch.Tensor:
+    """Compute contiguous expert groups using the common SwiGLU implementation.
+
+    Args:
+        experts: Stacked local SwiGLU weights and activation configuration.
+        batch: Expert-major input and exclusive end offsets.
+        weights: Optional weights resolved and validated before graph dispatch.
+
+    Returns:
+        Expert-major output with the same shape as ``batch.tokens``.
+
+    Note:
+        Graph routing supplies Python shape offsets, so tracing does not read
+        a runtime tensor on the host. Eager routing reads its dynamic tensor
+        offsets once, as its existing split already requires.
+    """
+    if batch.tokens.ndim != 2:
+        raise ValueError("ExpertBatch requires [rows, hidden] tokens")
+    if experts.local_expert_count <= 0:
+        raise ValueError("ExpertBatch requires at least one local expert")
+    if isinstance(batch.offsets, torch.Tensor):
+        if batch.offsets.ndim != 1:
+            raise ValueError("ExpertBatch tensor offsets must be one-dimensional")
+        ends = batch.offsets.tolist()
+    elif isinstance(batch.offsets, tuple):
+        ends = batch.offsets
+    else:
+        raise ValueError("ExpertBatch offsets must be a tensor or a tuple of integers")
+    if len(ends) != experts.local_expert_count or ends[-1] != batch.tokens.shape[0]:
+        raise ValueError("ExpertBatch offsets do not cover the local expert rows")
+    if any(not isinstance(end, int) or isinstance(end, bool) for end in ends):
+        raise ValueError("ExpertBatch offsets must contain integers")
+    if any(end < start for start, end in zip((0, *ends[:-1]), ends)):
+        raise ValueError("ExpertBatch offsets must be monotonic")
+    if weights is None:
+        weights = resolve_swiglu_weights(experts)
+    outputs = []
+    start = 0
+    for index, end in enumerate(ends):
+        outputs.append(swiglu_expert_forward(experts, batch.tokens[start:end], index, weights))
+        start = end
+    return torch.cat(outputs, dim=0)
 
 
 # ``ArgSort`` has no int32/int64 AICore kernel and silently falls back to
@@ -211,7 +484,7 @@ def _expert_token_counts(indices: torch.Tensor, num_experts: int) -> torch.Tenso
     return counts.scatter_add_(0, flat, torch.ones_like(flat))
 
 
-def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
+def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices=None, *, offsets=None):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
     This function is installed as ``experts.forward`` for the HF-native EP
@@ -219,6 +492,12 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
+    if offsets is not None:
+        if local_expert_indices is not None:
+            raise ValueError("Pass either expert indices or explicit offsets, not both")
+        return compute_expert_major(experts, ExpertBatch(dispatched_states, offsets))
+    if local_expert_indices is None:
+        raise ValueError("Local expert execution requires indices or explicit offsets")
     token_order = _argsort_keys(
         local_expert_indices, bound=experts.local_expert_count)
     sorted_states = dispatched_states[token_order]
@@ -244,45 +523,9 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         output[token_order] = sorted_output
         return output
 
-    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
-    # The eager path needs host ints: read them in one transfer rather than
-    # draining the queue once per local expert.
-    expert_token_counts = local_expert_counts.tolist()
-    sorted_outputs = []
-    token_start = 0
-    for local_expert_index in range(experts.local_expert_count):
-        expert_token_count = expert_token_counts[local_expert_index]
-        expert_states = sorted_states[token_start:token_start + expert_token_count]
-        if up_weight is None:
-            gate_up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            )
-            apply_gate = getattr(experts, "_ep_apply_gate", None)
-            if apply_gate is None:
-                gate_states, up_states = gate_up_states.chunk(2, dim=-1)
-                activation = getattr(experts, "_ep_act_fn", F.silu)
-                activated_states = activation(gate_states) * up_states
-            else:
-                activated_states = apply_gate(gate_up_states)
-        else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
-            activation = getattr(experts, "_ep_act_fn", F.silu)
-            activated_states = activation(gate_states) * up_states
-        sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activated_states,
-                down_weight[local_expert_index],
-            )
-        )
-        token_start += expert_token_count
-
-    sorted_output = torch.cat(sorted_outputs)
+    offsets = tuple(accumulate(local_expert_counts.tolist()))
+    batch = ExpertBatch(sorted_states, offsets)
+    sorted_output = compute_expert_major(experts, batch)
     output = torch.empty_like(sorted_output)
     output[token_order] = sorted_output
     return output
@@ -303,11 +546,51 @@ def _get_global_expert_count(module):
     )
 
 
+def _resolve_expert_activation(module: Any) -> Callable:
+    """Resolve the existing expert activation independently of dispatch selection."""
+    activation = getattr(module.experts, "act_fn", None)
+    if activation is not None:
+        return activation
+    hidden_act = getattr(getattr(module, "config", None), "hidden_act", "silu")
+    activation = {"gelu": F.gelu, "relu": F.relu, "silu": F.silu, "swish": F.silu}.get(hidden_act)
+    if activation is None:
+        raise ValueError(
+            f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
+            "provide experts.act_fn or extend the EP activation registry"
+        )
+    return activation
+
+
+def _bind_token_dispatcher(experts: Any, backend: str, group: Any, grouped: bool, validation_mode: str) -> None:
+    """Select the backend once and retain only its logical weight metadata."""
+    if backend not in ("dynamic", "fixed_slot"):
+        raise ValueError(f"Unknown EP dispatcher backend: {backend}")
+    if backend == "fixed_slot" and grouped:
+        raise ValueError("fixed_slot does not support grouped GEMM")
+    if backend == "fixed_slot" and group is None:
+        raise ValueError("fixed_slot requires an explicit ep_group at binding")
+    experts.token_dispatcher = (
+        FixedSlotTokenDispatcher(group, experts.local_expert_count, validation_mode)
+        if backend == "fixed_slot" else None
+    )
+    if backend == "fixed_slot":
+        # Malformed weights must be reported by the group preflight, not by
+        # only one rank while its peers proceed into capture.
+        try:
+            experts.ep_weight_shapes = _expert_weight_shapes(resolve_swiglu_weights(experts))
+        except (AttributeError, NotImplementedError, TypeError):
+            experts.ep_weight_shapes = None
+
+
 def bind_local_expert_forward(
     module: Any,
     ep_size: int,
     use_grouped_gemm: bool = False,
     apply_gate: Optional[Callable] = None,
+    *,
+    dispatcher_backend: str = "dynamic",
+    ep_group: Any = None,
+    validation_mode: str = "strict",
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
 
@@ -317,6 +600,11 @@ def bind_local_expert_forward(
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation. ``apply_gate`` supplies model-specific fused gate/up
     semantics when the default activation-times-up rule is insufficient.
+    ``dispatcher_backend="fixed_slot"`` binds the shared fixed-capacity
+    dispatcher and requires ``ep_group``; the default keeps ragged eager EP.
+    Both forms call ``experts(...)`` so parameter hooks surround compute.
+    ``validation_mode`` chooses strict peer diagnostics or local metadata-only
+    eager checks. Capture always uses peer agreement; see FixedSlotTokenDispatcher.
     """
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
@@ -324,20 +612,8 @@ def bind_local_expert_forward(
             f"num_experts ({global_expert_count}) must be divisible by ep_size ({ep_size})"
         )
     module.experts.local_expert_count = global_expert_count // ep_size
-    activation = getattr(module.experts, "act_fn", None)
-    if activation is None:
-        hidden_act = getattr(getattr(module, "config", None), "hidden_act", "silu")
-        activation = {
-            "gelu": F.gelu,
-            "relu": F.relu,
-            "silu": F.silu,
-            "swish": F.silu,
-        }.get(hidden_act)
-        if activation is None:
-            raise ValueError(
-                f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
-                "provide experts.act_fn or extend the EP activation registry"
-            )
+    activation = _resolve_expert_activation(module)
+    _bind_token_dispatcher(module.experts, dispatcher_backend, ep_group, use_grouped_gemm, validation_mode)
     if apply_gate is not None and use_grouped_gemm:
         raise ValueError("custom expert gate activation is not supported by grouped GEMM")
     # ``_ep_*`` is the contract the local compute path reads back off the module's
@@ -1058,6 +1334,21 @@ def ep_routed_forward(
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
+    dispatcher = getattr(module.experts, "token_dispatcher", None)
+    if dispatcher is not None:
+        return execute_routed_experts(
+            module.experts, hidden_states,
+            lambda: RoutingResult(*router_fn(module, hidden_states)), dispatcher, ep_group,
+        )
+    capture = _GRAPH_EP_CAPTURE.get()
+    if capture is not None:
+        capture.reject_backend(ep_group, "Graph EP requires dispatcher_backend='fixed_slot'; dynamic is eager-only")
+    return _dynamic_routed_forward(module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+
+
+def _dynamic_routed_forward(module: Any, hidden_states: torch.Tensor, *,
+                            router_fn: Callable, ep_group: Any) -> torch.Tensor:
+    """Keep the existing ragged eager dispatcher as a numerical reference."""
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
     local_expert_count = module.experts.local_expert_count
@@ -1256,6 +1547,11 @@ def ep_routed_dispatch(
         The pending :class:`EPRoutedState` to hand to
         :func:`ep_routed_experts_and_combine`.
     """
+    capture = _GRAPH_EP_CAPTURE.get()
+    if capture is not None:
+        capture.reject_split_dispatch(ep_group)
+    if getattr(module.experts, "token_dispatcher", None) is not None:
+        reject_routing(ep_group, "fixed_slot does not support split dispatch or chunk overlap")
     ep_size = ep_group.size()
     local_expert_count = module.experts.local_expert_count
     global_expert_count = local_expert_count * ep_size
