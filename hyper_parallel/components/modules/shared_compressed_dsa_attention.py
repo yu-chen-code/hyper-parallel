@@ -1011,11 +1011,24 @@ def _reference_sparse_attention(
     )
     allowed_counts.scatter_add_(2, safe_indices, valid.to(torch.int32))
     allowed = allowed_counts > 0
-    logits = torch.matmul(query, key_value.transpose(-1, -2)) * scale
+    # Flatten the broadcast head dimension before matmul: stock torch 2.9.1
+    # otherwise returns a collapsed key gradient during joint FX capture.
+    expanded_kv = key_value.expand(batch_size, num_heads, key_length, query.shape[-1])
+    flat_query = query.reshape(batch_size * num_heads, sequence_length, -1)
+    flat_kv = expanded_kv.reshape(batch_size * num_heads, key_length, -1)
+    logits = torch.bmm(flat_query, flat_kv.transpose(1, 2)).reshape(
+        batch_size, num_heads, sequence_length, key_length
+    ) * scale
     logits = logits.masked_fill(~allowed.unsqueeze(1), float("-inf"))
     sink_logits = sinks.view(1, num_heads, 1, 1).expand(batch_size, -1, sequence_length, -1)
     probabilities = torch.cat((logits, sink_logits), dim=-1).softmax(dim=-1, dtype=torch.float32)
-    return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
+    flat_probabilities = probabilities[..., :-1].to(key_value.dtype).reshape(
+        batch_size * num_heads, sequence_length, key_length
+    )
+    output = torch.bmm(flat_probabilities, flat_kv).reshape(
+        batch_size, num_heads, sequence_length, query.shape[-1]
+    )
+    return output.transpose(1, 2)
 
 
 class _NpuSparseAttentionWithScalarSink(torch.autograd.Function):

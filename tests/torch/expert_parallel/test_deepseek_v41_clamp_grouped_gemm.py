@@ -23,7 +23,7 @@ from tests.common.mark_utils import arg_mark
 @arg_mark(
     plat_marks=["platform_ascend910b"],
     level_mark="level1",
-    card_mark="1card",
+    card_mark="onecard",
     essential_mark="unessential",
 )
 def test_deepseek_v41_clamped_grouped_gemm() -> None:
