@@ -199,7 +199,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
 | PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b`); pure-PP v1 |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
-| EP | Planned | — |
+| EP | Experimental | Explicit static shapes; pure EP and supported FSDP+EP |
 
 ## Limitations
 
@@ -226,3 +226,44 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 - **Requires torch with a patched autograd engine** for joint-graph capture.
   On stock torch the backward half is annotated structurally instead (see
   `_annotate_autograd_backward` in `tracer/graph_tracer.py`).
+
+
+## Static expert parallelism (incremental support)
+
+The native dynamic EP implementation is unchanged. Existing eager factories,
+variable split dispatch/combine, grouped/chunked compute, attention and FSDP
+hooks do not import this implementation or acquire new per-step checks.
+Fixed capacity is an explicit graph-only implementation under `compile/`.
+Use a dedicated graph model; do not bind static expert forwards on a model
+that must continue running through the native eager EP factory.
+
+The graph path reuses native weight resolution, activation configuration and
+model Router helpers. Its padded dispatch and static expert slicing remain
+separate from the native dynamic algorithm. Unifying them is deferred until
+it can preserve eager performance and precision.
+
+The fixed dispatch budget is 256 MiB per tensor; it is not a full-step memory
+limit. Static shapes, identical per-rank signatures and call ordering are
+required. Invalid route replay marks output nonfinite. Capture preflight and
+the compiler's pre-optimizer finite-loss decision retain diagnostic host
+synchronization; this cost applies only to explicitly selected graph EP.
+
+Static graph precision remains under development. Differences from native
+dynamic execution require subsequent fixes; no graph/eager zero-error claim
+is made. Dynamic precision is verified separately against the exact master.
+
+
+Bind `hyper_parallel.compile.deepseek_v41_ep.deepseek_v41_graph_ep_compute_fn`
+on the graph V4.1 model, then enable `PassConfig(ep_enabled=True)` (set
+`fsdp_enabled=False` for pure EP). The native V4.1 EP factory is unchanged.
+The capture scope adapts broadcast matmul batches for torch 2.9.1 joint FX
+gradient layout only during tracing and restores the thread-local mode.
+Dynamic shapes, TP/PP/CP/SP/LP, grouped GEMM and shared/chunk overlap are
+outside this stage. All EP participants must use the explicit graph adapter.
+
+
+FSDP+EP uses separate dense and expert shard groups. Expert replication and
+dense HSDP are rejected; expert dimension zero must divide the expert shard
+degree. A shared ParamShardSpec plan drives graph and live parameter sharding.
+Finite-loss checks cover the dense FSDP group, while independent pure EP
+subgroups may execute different numbers of steps.
