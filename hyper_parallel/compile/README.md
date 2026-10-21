@@ -226,3 +226,11 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 - **Requires torch with a patched autograd engine** for joint-graph capture.
   On stock torch the backward half is annotated structurally instead (see
   `_annotate_autograd_backward` in `tracer/graph_tracer.py`).
+
+
+## Fixed-split EP collective primitive
+
+`hyper_parallel.compile.ep_collectives.ep_all_to_all` is an explicit functional
+collective for statically known send/receive splits. It supports autograd and
+joint FX capture; callers must agree on matching splits and group ordering.
+This first stage does not install routing adapters or change native eager EP.
