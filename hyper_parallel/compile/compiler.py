@@ -42,6 +42,7 @@ from torch.distributed.distributed_c10d import _register_process_group
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
 from .pass_config import PassConfig, normalize_dp_mode, build_pass_config_from_trainer_config
+from .expert_parallel import graph_ep_trace
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
@@ -118,6 +119,8 @@ class GraphCompiler:
         self.pass_config.validate()
 
         self._joint_graph = None
+        self._ep_sync_group = None
+        self._ep_expert_param_names = set()
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
 
     @staticmethod
@@ -149,13 +152,12 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
-        if (self.dynamic or self.dynamic_arg_dims is not None) and self.pass_config.pp_enabled:
-            raise ValueError(
-                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
-            )
+        self._validate_compile_shapes()
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
+        if self.pass_config.ep_enabled:
+            self._validate_ep_mesh()
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
             # ``FSDPPass`` early-returns when ``world_size == 1``, so a
@@ -166,7 +168,11 @@ class GraphCompiler:
         trace_kwargs = {}
         if self.dynamic or self.dynamic_arg_dims is not None:
             trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
-        joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
+        with graph_ep_trace(self.pass_config.ep_enabled, self.model) as capture:
+            joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
+        if self.pass_config.ep_enabled:
+            self._resolve_ep_sync_group(capture.groups)
+            self._ep_expert_param_names = capture.expert_param_names
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
@@ -179,6 +185,16 @@ class GraphCompiler:
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
+
+    def _validate_compile_shapes(self) -> None:
+        """Reject parallel combinations outside the symbolic tracer's support."""
+        symbolic = self.dynamic or self.dynamic_arg_dims is not None
+        if symbolic and self.pass_config.pp_enabled:
+            raise ValueError(
+                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
+            )
+        if symbolic and self.pass_config.ep_enabled:
+            raise ValueError("Graph EP currently requires static shapes; disable dynamic shapes")
 
     def forward_backward(self, **inputs: Any) -> Any:
         """
@@ -197,11 +213,27 @@ class GraphCompiler:
             loss values emitted by ``train_fn`` as extra graph outputs after
             the gradients (empty when ``train_fn`` returned a bare loss
             tensor).
+
+        Note:
+            EP loss validation synchronizes the captured EP group for pure
+            EP, or the dense FSDP group for FSDP+EP. All ranks in that group
+            must call this method in the same order. Independent pure EP
+            groups may use different schedules. Captured EP groups must have
+            identical membership for pure EP and be contained in the dense
+            FSDP group for FSDP+EP; compilation checks these constraints.
         """
         if self._joint_graph is None:
             self.compile(**inputs)
 
         loss, grads, loss_dict = self._run_graph(**inputs)
+
+        if self.pass_config.ep_enabled and dist.is_initialized():
+            # Agree within this compiler's training participants; independent
+            # EP subgroups need not execute steps in lockstep.
+            finite = torch.isfinite(loss).all().to(dtype=torch.int32)
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=self._ep_sync_group)
+            if not bool(finite.item()):
+                raise FloatingPointError("Graph EP loss is nonfinite on at least one rank")
 
         self._accumulate_grads(grads)
 
@@ -326,6 +358,8 @@ class GraphCompiler:
         names = tuple(getattr(fsdp_mesh, "mesh_dim_names", ()) or ())
         dp_mode = self._reconcile_mode_with_context(mesh_context, dp_mode)
         self.pass_config.dp_mode = dp_mode
+        if self.pass_config.ep_enabled:
+            self.pass_config.validate()
 
         if dp_mode == "ddp":
             dim = self._first_dim(names, ("fsdp_replicate", "dp_replicate", "dp"))
@@ -362,8 +396,44 @@ class GraphCompiler:
         # ("dp","cp","tp") and "dp" is the FSDP axis.
         dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
         sub = fsdp_mesh[dim]
-        self._register_mesh_group("fsdp", sub)
+        self._ep_sync_group = self._register_mesh_group("fsdp", sub)
         self.pass_config.fsdp_degree = sub.size()
+
+    def _resolve_ep_sync_group(self, ep_groups: list) -> None:
+        """Choose one participant set covering every captured EP collective."""
+        if not ep_groups:
+            raise ValueError("Graph EP capture found no EP communication group")
+        group = self._ep_sync_group if self.pass_config.fsdp_enabled else ep_groups[0]
+        if group is None:
+            raise ValueError("Graph FSDP+EP requires a registered dense FSDP group")
+        participants = set(dist.get_process_group_ranks(group))
+        for ep_group in ep_groups:
+            ranks = set(dist.get_process_group_ranks(ep_group))
+            if self.pass_config.fsdp_enabled:
+                valid = ranks <= participants
+            else:
+                valid = ranks == participants
+            if not valid:
+                raise ValueError("Captured EP group is incompatible with the compiler's loss synchronization group")
+        self._ep_sync_group = group
+
+    def _validate_ep_mesh(self) -> None:
+        """Reject unsupported actual axes in either pure EP or FSDP+EP."""
+        if self._mesh_context is None:
+            return
+        for axis in ("tp_size", "pp_size", "cp_size"):
+            size = getattr(self._mesh_context, axis, 1)
+            if size != 1:
+                raise ValueError(
+                    f"Graph EP does not support MeshContext.{axis}={size}"
+                )
+        for mode in ("sequence_parallel", "loss_parallel"):
+            if getattr(self._mesh_context, mode, False):
+                raise ValueError(
+                    f"Graph EP does not support MeshContext.{mode}"
+                )
+
+
 
     def _reconcile_mode_with_context(self, mesh_context: Any, dp_mode: str) -> str:
         """Align ``dp_mode`` with the ``MeshContext`` topology (eager parity).
@@ -412,9 +482,11 @@ class GraphCompiler:
         return None
 
     @staticmethod
-    def _register_mesh_group(name: str, sub_mesh: Any) -> None:
+    def _register_mesh_group(name: str, sub_mesh: Any) -> dist.ProcessGroup:
         """Register ``sub_mesh``'s process group under ``name``."""
-        _register_process_group(name, sub_mesh.get_group())
+        group = sub_mesh.get_group()
+        _register_process_group(name, group)
+        return group
 
     def _resolve_hsdp_degrees(self, world_size: int) -> Tuple[int, int]:
         """Resolve ``(shard, replicate)`` for a fallback 2-D HSDP mesh.
