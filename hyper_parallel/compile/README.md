@@ -226,3 +226,29 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 - **Requires torch with a patched autograd engine** for joint-graph capture.
   On stock torch the backward half is annotated structurally instead (see
   `_annotate_autograd_backward` in `tracer/graph_tracer.py`).
+
+
+## Static expert parallelism (incremental support)
+
+The native dynamic EP implementation is unchanged. Existing eager factories,
+variable split dispatch/combine, grouped/chunked compute, attention and FSDP
+hooks do not import this implementation or acquire new per-step checks.
+Fixed capacity is an explicit graph-only implementation under `compile/`.
+Use a dedicated graph model; do not bind static expert forwards on a model
+that must continue running through the native eager EP factory.
+
+The graph path reuses native weight resolution, activation configuration and
+model Router helpers. Its padded dispatch and static expert slicing remain
+separate from the native dynamic algorithm. Unifying them is deferred until
+it can preserve eager performance and precision.
+
+The fixed dispatch budget is 256 MiB per tensor; it is not a full-step memory
+limit. Static shapes, identical per-rank signatures and call ordering are
+required. The explicit static API exchanges preparation status before data
+collectives and marks invalid replay IDs nonfinite. GraphCompiler integration
+is delivered in the next stage. Low-level callers must coordinate failure
+before updating parameters. Native dynamic execution never calls this API.
+
+Static graph precision remains under development. Differences from native
+dynamic execution require subsequent fixes; no graph/eager zero-error claim
+is made. Dynamic precision is verified separately against the exact master.
