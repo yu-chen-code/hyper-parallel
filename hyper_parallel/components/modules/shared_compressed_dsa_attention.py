@@ -1190,11 +1190,14 @@ def reference_sparse_attention(
     )
     allowed_counts.scatter_add_(2, safe_indices, valid.to(torch.int32))
     allowed = allowed_counts > 0
-    logits = torch.matmul(query, key_value.transpose(-1, -2)) * scale
+    # NPU matmul's traced backward drops singleton leading KV dimensions.
+    # Expose the shared matrix directly while retaining the matmul kernels.
+    keys = key_value[0, 0] if batch_size == 1 else key_value
+    logits = torch.matmul(query, keys.transpose(-1, -2)) * scale
     logits = logits.masked_fill(~allowed.unsqueeze(1), float("-inf"))
     sink_logits = sinks.view(1, num_heads, 1, 1).expand(batch_size, -1, sequence_length, -1)
     probabilities = torch.cat((logits, sink_logits), dim=-1).softmax(dim=-1, dtype=torch.float32)
-    return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
+    return torch.matmul(probabilities[..., :-1].to(keys.dtype), keys).transpose(1, 2)
 
 
 class SharedCompressedDSAAttentionBase(nn.Module):

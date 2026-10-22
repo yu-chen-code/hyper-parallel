@@ -1,0 +1,109 @@
+# Four-card V4.1 graph smoke: FSDP4 + EP2 + EDP-shard2, no recomputation.
+# Run scripts/train_lm.py with --model.config_path and --model.engram_assets_path.
+# The config and scaled Engram assets use the existing V4.1 crop builder.
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: /path/to/engram_d8.json
+  num_hidden_layers: 1
+  text_parameter_divisor: 8
+  num_routed_experts: 8
+  exercise_post_training_indexer: false
+  router_aux_loss_coeff: 0.0
+  router_bias_update_rate: 0.0
+  torch_dtype: bfloat16
+
+model_init_dtype: bfloat16
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 1.0e-4
+    adamw_weight_decay: 0.0
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-4
+    lr_warmup_steps: 0
+
+training:
+  train_iters: 10
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 2
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 2
+
+plan_overrides:
+  - match: "model.layers.*.*_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: true
+
+compile:
+  enabled: true
+  use_joint_graph: true
+
+mixed_precision:
+  enabled: false
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: deepseek-v41-graph-smoke
+      tokenizer_type: pretokenized
+      vocab_size: 129280
+      eod_token_id: 1
+      pad_token_id: 2
+  data_config:
+    seq_length: 8
+    split: "1, 0, 0"
+    mock_data: true
+    data_lazy_load: true
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  num_workers: 0
+  use_background_prefetcher: false
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: dense
+
+activation_checkpoint:
+  mode: "off"
+
+checkpoint:
+  save_ckpt: false

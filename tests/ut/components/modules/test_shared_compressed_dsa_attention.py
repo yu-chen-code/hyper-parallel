@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
@@ -185,6 +186,27 @@ def _selected_attention(query, key_value, indices, sinks, scale):
 
 class TestCompressedAttentionReference(unittest.TestCase):
     """The unfused path preserves sink, duplicate-index and empty-row semantics."""
+
+    def test_single_batch_joint_graph_replay(self):
+        """Preserve singleton KV dimensions and gradients across graph replays."""
+        indices = torch.tensor([[[0, -1], [0, 1]]])
+
+        def _joint(query, keys, sinks):
+            """Capture the attention output and all three input gradients."""
+            output = reference_sparse_attention(query, keys, indices, sinks, .4)
+            return output, torch.autograd.grad(output.sum(), (query, keys, sinks))
+
+        values = [torch.randn(1, 3, 2, 5), torch.randn(1, 1, 2, 5), torch.randn(3)]
+        values = [value.requires_grad_() for value in values]
+        graph = make_fx(_joint, tracing_mode="fake", _allow_non_fake_inputs=True)(*values)
+        for offset in (0., .25):
+            inputs = [(value.detach() + offset).requires_grad_() for value in values]
+            actual, gradients = graph(*inputs)
+            expected = _selected_attention(*inputs[:2], indices, inputs[2], .4)
+            reference = torch.autograd.grad(expected.sum(), inputs)
+            torch.testing.assert_close(actual, expected)
+            for current, target in zip(gradients, reference):
+                torch.testing.assert_close(current, target)
 
     def test_selected_formula_and_all_gradients(self):
         """Compare a selected-key oracle with duplicate, padded and empty rows."""
