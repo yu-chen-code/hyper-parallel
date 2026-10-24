@@ -29,6 +29,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +37,7 @@ from torch.nn import Module as ModuleClass
 from torch.nn import Parameter as ParameterClass
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
+from hyper_parallel.core.expert_parallel.fsdp import expert_shard_placement
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
 from hyper_parallel.distributed._builder.source_shard import (
     SourceShardInfoByFQN,  # pylint: disable=unused-import
@@ -626,6 +628,10 @@ class FSDP2Manager:
                     raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
                 fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
                     self._build_fsdp_actual_mesh(expert=True)
+                )
+                fsdp_sublayer_kwargs["shard_placement_fn"] = partial(
+                    expert_shard_placement,
+                    shard_degree=self.mesh_context.fsdp_moe_mesh["edp_shard"].size(),
                 )
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,

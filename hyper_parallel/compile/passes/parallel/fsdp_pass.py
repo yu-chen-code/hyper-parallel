@@ -47,6 +47,9 @@ Responsibilities:
 
 All DP logic (which parameters, the collectives, and the sharding itself)
 lives in this pass; the trainer simply feeds ``model.parameters()``.
+
+Routed experts share eager FSDP's placement policy. If the expert axis cannot
+be evenly sharded, an inner axis is packed for dim-0 collectives instead.
 """
 
 __all__ = ["FSDPPass"]
@@ -63,6 +66,8 @@ from torch import fx, nn
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.node import _side_effectful_functions
 from torch.ops import _c10d_functional
+
+from hyper_parallel.core.expert_parallel.fsdp import expert_shard_placement
 
 from ...pass_config import PassConfig, normalize_dp_mode
 from ..base import GraphPass
@@ -248,6 +253,7 @@ class FSDPPass(GraphPass):
         # ``_classify_dp_params`` and consumed by the all_gather / grad-reduce /
         # live-shard steps so they are pad-sharded like eager ``fully_shard``.
         self._padded_params: Dict[str, _PaddedParam] = {}
+        self._shard_dims: Dict[str, int] = {}
 
     def run(
         self,
@@ -402,6 +408,7 @@ class FSDPPass(GraphPass):
         self._fsdp_modules = set()
         self._unsharded_params = {}
         self._padded_params = {}
+        self._shard_dims = {}
 
     def _apply_dp_transforms(
         self,
@@ -590,11 +597,9 @@ class FSDPPass(GraphPass):
             return False
         _, degree = self._param_group(fqn)
         shape = param.shape
-        if fqn in self._expert_param_names and (not shape or shape[0] % degree):
-            raise ValueError(
-                f"Graph FSDP+EP expert parameter {fqn} with shape {tuple(shape)} "
-                f"cannot shard across edp_shard degree {degree}"
-            )
+        if fqn in self._expert_param_names:
+            self._shard_dims[fqn] = expert_shard_placement(param, shard_degree=degree).dim
+            return False
         if shape and shape[0] % degree == 0:
             return False
         if not shape:
@@ -641,7 +646,7 @@ class FSDPPass(GraphPass):
 
     def _shard_live_model_params(self, model: nn.Module) -> None:
         """
-        Physically shard the live model's parameters in place (dim 0).
+        Physically shard live parameters along their selected dimension.
 
         After this, model.parameters() yields the local shards.
         """
@@ -678,6 +683,14 @@ class FSDPPass(GraphPass):
             if group_name not in group_ranks:
                 group_ranks[group_name] = dist.get_rank(group=_resolve_process_group(group_name))
             rank = group_ranks[group_name]
+            shard_dim = self._shard_dims.get(name, 0)
+
+            if shard_dim:
+                param.data = param.detach().chunk(degree, dim=shard_dim)[rank].clone(
+                    memory_format=torch.contiguous_format
+                )
+                sharded_count += 1
+                continue
 
             # Pad-shard a non-divisible param (recorded by
             # ``_classify_dp_params``): zero-pad dim 0 to a multiple of the
@@ -794,13 +807,17 @@ class FSDPPass(GraphPass):
             anchor = self._first_user(param_node) if sink else None
 
             group_name, degree = self._param_group(param_node.meta.get("param_name", ""))
+            shard_dim = self._shard_dims.get(param_node.meta.get("param_name", ""), 0)
+            original_users = list(param_node.users)
 
             # AllGather + immediate wait for correctness; AutoOverlapPass may
             # sink the wait past independent compute later.
             with _insertion_point(graph, anchor, param_node):
+                gather_input = self._move_shard_dim(graph, param_node, shard_dim, 0)
+            with _insertion_point(graph, anchor, gather_input):
                 ag_node = graph.call_function(
                     _c10d_functional.all_gather_into_tensor,
-                    args=(param_node, degree, group_name),
+                    args=(gather_input, degree, group_name),
                 )
                 ag_node.meta["comm_type"] = "fsdp_all_gather"
                 ag_node.meta["comm_group"] = group_name
@@ -821,6 +838,9 @@ class FSDPPass(GraphPass):
                     args=(ag_node,),
                 )
                 wait_node.meta["wait_for"] = ag_node.name
+
+            with graph.inserting_after(wait_node):
+                wait_node = self._move_shard_dim(graph, wait_node, 0, shard_dim)
 
             param_node.meta["fsdp_sharded"] = True
             param_node.meta["fsdp_ag_node"] = ag_node.name
@@ -846,9 +866,8 @@ class FSDPPass(GraphPass):
                 replacement.meta["param_name"] = param_node.meta.get("param_name")
                 replacement.meta["state_idx"] = param_node.meta.get("state_idx")
 
-            for user in list(param_node.users.keys()):
-                if user not in (ag_node, wait_node):
-                    user.replace_input_with(param_node, replacement)
+            for user in original_users:
+                user.replace_input_with(param_node, replacement)
 
             self._processed_params.add(param_node.name)
 
@@ -956,6 +975,7 @@ class FSDPPass(GraphPass):
                 new_returned[i] = self._build_grad_reduction_nodes(
                     graph, grad_node, replicated=replicated, pad_info=pad_info,
                     group_name=group_name, degree=degree,
+                    shard_dim=self._shard_dims.get(state_fqns[state_idx], 0),
                 )
 
         output_node.args = (type(returned)(new_returned),) + tuple(output_node.args[1:])
@@ -970,6 +990,7 @@ class FSDPPass(GraphPass):
         pad_info: Optional[_PaddedParam] = None,
         group_name: Optional[str] = None,
         degree: Optional[int] = None,
+        shard_dim: int = 0,
     ) -> fx.Node:
         """Build and return the waited gradient-reduction node for ``grad_node``.
 
@@ -1022,6 +1043,7 @@ class FSDPPass(GraphPass):
                 if self._dp_mode == "hsdp":
                     reduced = self._insert_wait(graph, reduced)
         elif self._dp_mode in ("fsdp", "hsdp"):
+            reduced = self._move_shard_dim(graph, reduced, shard_dim, 0)
             # Matmul backward can return a transposed view on NPU, including dense router weights.
             reduced = graph.call_method("contiguous", args=(reduced,))
             rs_node = graph.call_function(
@@ -1053,7 +1075,26 @@ class FSDPPass(GraphPass):
             ar_node.meta["dp_replicate_degree"] = self._dp_replicate_degree
             reduced = ar_node
 
-        return self._insert_wait(graph, reduced)
+        reduced = self._insert_wait(graph, reduced)
+        return self._move_shard_dim(graph, reduced, 0, shard_dim) if not replicated else reduced
+
+    @staticmethod
+    def _move_shard_dim(
+        graph: fx.Graph, tensor: fx.Node, source: int, destination: int, backward: bool = False,
+    ) -> fx.Node:
+        """Pack or restore a shard axis with canonical contiguous strides."""
+        if source == destination:
+            return tensor
+        moved = graph.call_function(torch.ops.aten.movedim.int, args=(tensor, source, destination))
+        # contiguous() keeps arbitrary singleton strides, which grouped GEMM cannot consume.
+        with graph.inserting_after(moved):
+            contiguous = graph.call_function(
+                torch.ops.aten.clone.default, args=(moved,), kwargs={"memory_format": torch.contiguous_format},
+            )
+        if backward:
+            moved.meta["autograd_backward"] = True
+            contiguous.meta["autograd_backward"] = True
+        return contiguous
 
     @staticmethod
     def _insert_wait(graph: fx.Graph, tensor_node: fx.Node) -> fx.Node:
@@ -1216,10 +1257,12 @@ class FSDPPass(GraphPass):
     ) -> fx.Node:
         """Insert the backward all_gather + wait pair before ``anchor``."""
         group_name, degree = self._param_group(record.param_node.meta.get("param_name", ""))
+        shard_dim = self._shard_dims.get(record.param_node.meta.get("param_name", ""), 0)
         with graph.inserting_before(anchor):
+            gather_input = self._move_shard_dim(graph, record.param_node, shard_dim, 0, backward=True)
             ag_node = graph.call_function(
                 _c10d_functional.all_gather_into_tensor,
-                args=(record.param_node, degree, group_name),
+                args=(gather_input, degree, group_name),
             )
             ag_node.meta["comm_type"] = "fsdp_all_gather_backward"
             ag_node.meta["comm_group"] = group_name
@@ -1237,7 +1280,10 @@ class FSDPPass(GraphPass):
             )
             wait_node.meta["wait_for"] = ag_node.name
             wait_node.meta["autograd_backward"] = True
-        return wait_node
+        with graph.inserting_before(anchor):
+            restored = self._move_shard_dim(graph, wait_node, 0, shard_dim, backward=True)
+        restored.meta["autograd_backward"] = True
+        return restored
 
     def _clone_with_remap(
         self,

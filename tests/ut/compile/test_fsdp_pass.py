@@ -512,10 +512,10 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
 
-    def test_run_rejects_non_divisible_expert_param(self):
+    def test_run_rejects_expert_without_divisible_axis(self):
         """Do not silently replicate an unsynchronized trainable expert."""
         cfg = PassConfig(fsdp_enabled=True, fsdp_degree=4)
-        for shape in ((2, 4), ()):
+        for shape in ((2, 3), ()):
             with self.subTest(shape=shape):
                 gm = _odd_joint_graph()
                 model = _OddParam()

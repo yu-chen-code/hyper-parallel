@@ -166,6 +166,7 @@ def _trace_and_run(
     reshard: bool,
     world_size: int = _DEGREE,
     rank: int = 0,
+    expert_params: tuple = (),
 ) -> Tuple[torch.fx.GraphModule, nn.Module]:
     """Trace ``model``, run FSDPPass on a sharded copy, return (graph, copy).
 
@@ -192,7 +193,7 @@ def _trace_and_run(
     )
     pass_obj = FSDPPass(parallel_plan=GraphParallelPlan().fsdp_mark_pattern("*"))
     with _patch_dist(world_size=world_size, rank=rank):
-        pass_obj.run(graph, config, model=live, fsdp_group_name="fsdp")
+        pass_obj.run(graph, config, model=live, fsdp_group_name="fsdp", expert_param_names=expert_params)
     graph.graph.lint()
     return graph, live
 
@@ -405,6 +406,48 @@ class TestReshardNumerics(unittest.TestCase):
             expected = ref_grad.chunk(_DEGREE, dim=0)[0]
             self.assertTrue(torch.allclose(grad, expected, atol=1e-10))
         return graph
+
+    def test_inner_expert_shards_replay_with_and_without_reshard(self):
+        """Packing preserves all expert values and backward re-gather lifetime."""
+        class Experts(nn.Module):
+            """Two expert matrices with a singleton expert axis."""
+
+            def __init__(self) -> None:
+                """Create both expert projections."""
+                super().__init__()
+                self.first = nn.Parameter(torch.randn(1, 8, 8, dtype=torch.float64))
+                self.second = nn.Parameter(torch.randn(1, 8, 4, dtype=torch.float64))
+
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                """Apply both expert matrices."""
+                return inputs @ self.first[0] @ self.second[0]
+
+        class ExpertRank(_SimulatedRank):
+            """Simulate all-gather in the packed communication layout."""
+
+            def call_function(self, target: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+                """Restore the full packed projection before its consumer."""
+                if "all_gather_into_tensor" in str(target):
+                    return packed_full[args[0].shape[-1]].clone()
+                if target is torch.ops.aten.select.int and args[0].ndim == 3:
+                    torch.testing.assert_close(args[0].stride(), torch.empty(args[0].shape).stride())
+                return super().call_function(target, args, kwargs)
+
+        torch.manual_seed(7)
+        reference = Experts()
+        packed_full = {p.shape[-1]: p.detach().movedim(1, 0).contiguous() for p in reference.parameters()}
+        for reshard in (False, True):
+            with self.subTest(reshard=reshard):
+                graph, live = _trace_and_run(reference, reshard, expert_params=("first", "second"))
+                self.assertEqual([tuple(p.shape) for p in live.parameters()], [(1, 4, 8), (1, 4, 4)])
+                for _ in range(2):
+                    inputs, labels = torch.randn(4, 8).double(), torch.randn(4, 4).double()
+                    loss = nn.functional.mse_loss(reference(inputs), labels)
+                    expected = torch.autograd.grad(loss, tuple(reference.parameters()))
+                    result = ExpertRank(graph, {}, 2).run(*extract_module_state(live).values(), inputs, labels)
+                    torch.testing.assert_close(result[0], loss)
+                    for actual, grad in zip(result[1:], expected):
+                        torch.testing.assert_close(actual, grad.chunk(2, dim=1)[0])
 
     def test_two_layer_gradients_match(self):
         """2-layer MLP: loss and per-parameter grads match the reference."""

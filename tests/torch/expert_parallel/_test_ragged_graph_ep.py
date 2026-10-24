@@ -25,8 +25,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from hyper_parallel import DTensor, SkipDTensorDispatch, fully_shard
 from hyper_parallel.compile import GraphCompiler, PassConfig
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph
+from hyper_parallel.core.expert_parallel.fsdp import expert_shard_placement
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward, ep_routed_forward
 from hyper_parallel.distributed.mesh import MeshContext
 from tests.torch.utils import get_device_type
@@ -35,23 +37,23 @@ from tests.torch.utils import get_device_type
 class _RaggedMoE(nn.Module):
     """Small learned router, stacked experts and shared projection."""
 
-    def __init__(self, group: object) -> None:
+    def __init__(self, group: object, num_experts: int = 4) -> None:
         """Keep complete local experts and replicated router/shared weights."""
         super().__init__()
         self.group = group
-        self.gate = nn.Linear(64, 4, bias=False)
+        self.gate = nn.Linear(64, num_experts, bias=False)
         self.shared = nn.Linear(64, 64, bias=False)
         self.experts = nn.Module()
-        self.experts.num_experts = 4
-        self.experts.gate_up_proj = nn.Parameter(torch.randn(2, 128, 64) * 0.01)
-        self.experts.down_proj = nn.Parameter(torch.randn(2, 64, 64) * 0.01)
+        self.experts.num_experts = num_experts
+        self.experts.gate_up_proj = nn.Parameter(torch.randn(num_experts // 2, 128, 64) * 0.01)
+        self.experts.down_proj = nn.Parameter(torch.randn(num_experts // 2, 64, 64) * 0.01)
         bind_local_expert_forward(self, 2, use_grouped_gemm=True)
 
     def forward(self, hidden: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         """Use per-call destinations while retaining learned router gradients."""
-        logits = self.gate(hidden).float().reshape(-1, 4)
+        logits = self.gate(hidden).float().reshape(-1, self.experts.num_experts)
         preference = torch.zeros_like(logits).scatter(1, ids, 100.0)
-        weights, selected = (logits + preference).softmax(dim=-1).topk(2, dim=-1)
+        weights, selected = (logits + preference).softmax(dim=-1).topk(ids.shape[-1], dim=-1)
 
         def router(dummy_module: nn.Module, dummy_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """Pass differentiable scores and this call's expert IDs."""
@@ -72,6 +74,11 @@ def _compare_models(reference, candidate, dtype, gradients, expert_mesh=None):
     tolerances = {"rtol": 1e-5, "atol": 1e-6} if dtype == torch.float32 else {"rtol": 1e-2, "atol": 1e-3}
     for (name, left), (_, right) in zip(reference.named_parameters(), candidate.named_parameters()):
         expected, actual = (left.grad, right.grad) if gradients else (left, right)
+        if isinstance(expected, DTensor):
+            expected = expected.to_local()
+            if not name.startswith("experts.") and actual.shape != expected.shape:
+                padding = actual.shape[0] - expected.shape[0]
+                expected = torch.cat((expected, expected.new_zeros((padding, *expected.shape[1:]))))
         if expert_mesh is not None:
             group = expert_mesh.get_group() if name.startswith("experts.") else dist.group.WORLD
             expected = expected.chunk(dist.get_world_size(group), dim=0)[dist.get_rank(group)]
@@ -217,3 +224,45 @@ def test_ragged_joint_graph(dtype):
 def test_ragged_fsdp_joint_graph(dtype):
     """Verify distinct dense and expert sharding/reduction groups on four ranks."""
     _run_case(dtype, sharded=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("num_experts", [2, 4], ids=["inner", "experts"])
+def test_expert_fsdp_eager_graph(dtype, num_experts):
+    """Real eager FSDP and the joint graph share expert and inner placements."""
+    degree = dist.get_world_size()
+    context = MeshContext(dp_size=degree, dp_shard_size=degree, ep_size=2, edp_shard_size=degree // 2)
+    context.build_meshs(get_device_type(), degree)
+    device = torch.device(get_device_type())
+    group = context.fsdp_moe_mesh["ep"].get_group()
+    torch.manual_seed(42)
+    reference = _RaggedMoE(group, num_experts).to(device=device, dtype=dtype)
+    candidate = _RaggedMoE(group, num_experts).to(device=device, dtype=dtype)
+    candidate.load_state_dict(reference.state_dict())
+    torch.testing.assert_close(candidate.state_dict(), reference.state_dict(), rtol=0, atol=0)
+    fully_shard(reference.experts, mesh=context.fsdp_moe_mesh["edp_shard"],
+                shard_placement_fn=partial(expert_shard_placement, shard_degree=degree // 2))
+    fully_shard(reference, mesh=context.fsdp_non_moe_mesh["fsdp_shard"])
+    compiler = GraphCompiler(candidate, _loss, PassConfig(enable_overlap=False), device=device, mesh_context=context)
+    optimizers = [torch.optim.SGD(model.parameters(), lr=0.001) for model in (reference, candidate)]
+    tolerances = {"rtol": 1e-5, "atol": 1e-6} if dtype == torch.float32 else {"rtol": 1e-2, "atol": 1e-3}
+    with SkipDTensorDispatch(), patch("hyper_parallel.compile.compiler.trace_model_graph",
+                                      wraps=trace_model_graph) as capture:
+        for step in range(10):
+            for optimizer in optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            for microbatch in range(2):
+                torch.manual_seed(71 + step * 2 + microbatch + dist.get_rank())
+                hidden = torch.randn(1, 8, 64, device=device, dtype=dtype)
+                destination = 0 if (step + microbatch) % 2 == 0 else num_experts // 2
+                ids = torch.full((8, 1), destination, device=device, dtype=torch.long)
+                expected, details = _loss(reference, hidden, ids)
+                expected.backward()
+                actual, outputs = compiler.forward_backward(hidden=hidden, ids=ids)
+                torch.testing.assert_close(actual, expected.detach(), **tolerances)
+                torch.testing.assert_close(outputs["output"], details["output"], **tolerances)
+            _compare_models(reference, candidate, dtype, gradients=True)
+            for optimizer in optimizers:
+                optimizer.step()
+            _compare_models(reference, candidate, dtype, gradients=False)
+    assert capture.call_count == 1, f"Expected one capture, got {capture.call_count}"

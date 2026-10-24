@@ -46,3 +46,17 @@ def test_ragged_fsdp_joint_graph(dtype):
     """
     worker = str(Path(__file__).with_name("_test_ragged_graph_ep.py"))
     torchrun_case(file_name=worker, case_name=f"test_ragged_fsdp_joint_graph[{dtype}]", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+@pytest.mark.parametrize("placement", ["inner", "experts"])
+def test_expert_fsdp_eager_graph(dtype, placement):
+    """
+    Feature: Unified expert FSDP placements for eager and graph execution.
+    Description: Compare real fully_shard with inner or expert-axis graph sharding and changing empty ranks.
+    Expectation: Ten updates, accumulated gradients and every updated shard match with one capture.
+    """
+    worker = str(Path(__file__).with_name("_test_ragged_graph_ep.py"))
+    torchrun_case(file_name=worker, case_name=f"test_expert_fsdp_eager_graph[{placement}-{dtype}]", num_proc=4)
