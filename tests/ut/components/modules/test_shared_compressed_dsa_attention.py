@@ -195,6 +195,27 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         torch.testing.assert_close(loss, torch.tensor(0.))
         torch.testing.assert_close(query.grad, torch.zeros_like(query))
 
+    def test_flash_attention_retains_torch_candidates_and_parameters(self):
+        """Main attention fusion leaves candidate selection and source state intact."""
+        source = _source(True)
+        source.candidate_source_layer_idx = 0
+        source.indexer.is_candidate_source = True
+        parameters = {name: id(value) for name, value in source.named_parameters()}
+        module = attention.SharedCompressedDSAFlashAttention(source)
+        # V4.1 uses the existing replacement type to initialize scalar sinks.
+        self.assertIsInstance(module, attention.SharedCompressedDSAAttention)
+        self.assertEqual({name: id(value) for name, value in module.named_parameters()}, parameters)
+        self.assertFalse(module.indexer.use_fused)
+        _, candidates = module.indexer._select_indices(
+            self.query, self.key, self.weights, None, 0, None, None, None,
+        )
+        self.assertIsNotNone(candidates)
+        query = torch.ones(1, 1, 2, 512)
+        with patch.object(attention, "reference_sparse_attention") as reference:
+            with self.assertRaisesRegex(RuntimeError, "requires NPU FA V3"):
+                module._run_sparse_attention(query, query, None, None, 0, 2, None, ((0, 2, 0, 2, 0),))
+            reference.assert_not_called()
+
 
 def _selected_attention(query, key_value, indices, sinks, scale):
     """Enumerate visible keys without constructing the production dense mask."""

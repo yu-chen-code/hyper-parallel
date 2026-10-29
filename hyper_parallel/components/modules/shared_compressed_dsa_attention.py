@@ -1151,6 +1151,14 @@ class SharedCompressedDSAIndexer(nn.Module):
         return topk_indices, candidate_blocks
 
 
+def _sparse_attention_mask(sparse_indices: torch.Tensor, key_length: int) -> torch.Tensor:
+    """Deduplicate selected keys into a shared per-query visibility mask."""
+    valid = sparse_indices >= 0
+    counts = torch.zeros(*sparse_indices.shape[:2], key_length, dtype=torch.int32, device=sparse_indices.device)
+    counts.scatter_add_(2, sparse_indices.clamp_min(0).long(), valid.to(torch.int32))
+    return counts > 0
+
+
 def reference_sparse_attention(
         query: torch.Tensor,
         key_value: torch.Tensor,
@@ -1691,12 +1699,42 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         )
 
 
+@module_replacement
+class SharedCompressedDSAFlashAttention(SharedCompressedDSAAttention):
+    """Native FA V3 with scalar sinks and the model's Torch Indexer selection."""
+
+    def __init__(self, module: nn.Module, module_fqn: str = "", context: Mapping[str, Any] | None = None) -> None:
+        """Reuse source parameters while preserving candidate-pool and Indexer loss semantics."""
+        super().__init__(module, module_fqn, context, use_fused_ops=False)
+
+    def _run_sparse_attention(
+            self, query: torch.Tensor, key_value: torch.Tensor, compressed_kv: torch.Tensor | None,
+            topk_indices: torch.Tensor | None, query_offset: int, global_sequence_length: int,
+            segment_starts: torch.Tensor | None, query_segments: tuple,
+    ) -> torch.Tensor:
+        """Apply the selected-key mask inside fused attention, without dense score tensors."""
+        del query_segments
+        if query.device.type != "npu":
+            raise RuntimeError("SharedCompressedDSAFlashAttention requires NPU FA V3 with sink support")
+        keys, indices = self._build_sparse_indices(
+            key_value, compressed_kv, topk_indices, query.shape[2], query_offset,
+            global_sequence_length, segment_starts,
+        )
+        allowed = _sparse_attention_mask(indices, keys.shape[2])
+        keys = keys.contiguous()
+        return torch.ops.npu.npu_fusion_attention_v3(
+            query.contiguous(), keys, keys, query.shape[1], "BNSD",
+            atten_mask=(~allowed).unsqueeze(1), scale=self.scaling, sink=self.sinks.float(),
+        )[0].transpose(1, 2)
+
+
 __all__ = [
     "SharedCompressedAttentionCPContext",
     "SharedCompressedAttentionState",
     "SharedCompressedPackedSequence",
     "SharedCompressedAttentionTPContext",
     "SharedCompressedDSAAttention",
+    "SharedCompressedDSAFlashAttention",
     "SharedCompressedDSAAttentionBase",
     "SharedCompressedDSAIndexer",
     "build_sliding_window_indices",

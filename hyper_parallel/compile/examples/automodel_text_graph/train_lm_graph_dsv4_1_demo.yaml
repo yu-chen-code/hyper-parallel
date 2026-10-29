@@ -1,0 +1,125 @@
+# Flash-width V4.1 FA3 joint graph: FSDP8 + EP8, indexed 4K tokens, no recomputation.
+# Supply original Flash config and assets with empty Engram layer_ids/num_embeddings.
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: /path/to/engram_disabled.json
+  num_hidden_layers: 4
+  text_parameter_divisor: 1
+  num_routed_experts: 16
+  exercise_post_training_indexer: false
+  indexer_loss_coeff: 0.0
+  router_aux_loss_coeff: 0.0
+  router_bias_update_rate: 0.0
+  torch_dtype: bfloat16
+
+model_init_dtype: bfloat16
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+training:
+  train_iters: 10
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 1
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
+    replace_module:
+      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAFlashAttention
+  - match: "model.layers.*.*_hc"
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+  - match: "model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: true
+
+compile:
+  enabled: true
+  use_joint_graph: true
+  dynamic: false
+  fsdp_allgather_prefetch: false
+  fsdp_overlap_grad_reduce: false
+
+mixed_precision:
+  enabled: false
+
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: /path/to/indexed/train
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: deepseek-v41-flash-graph-4k
+      tokenizer_type: pretokenized
+      vocab_size: 129280
+      eod_token_id: 1
+      pad_token_id: 2
+  data_config:
+    seq_length: 4096
+    split: "1, 0, 0"
+    mock_data: false
+    data_lazy_load: true
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  num_workers: 0
+  use_background_prefetcher: false
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: dense
+
+activation_checkpoint:
+  mode: "off"
+
+checkpoint:
+  save_ckpt: false

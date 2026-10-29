@@ -84,8 +84,9 @@ class GraphCompiler:
                 if both are omitted, it uses ``PassConfig()``.
             parallel_plan: GraphParallelPlan declaring which modules to shard
                 (optional; enables declarative sharding)
-            trainer_config: Optional trainer topology used only to infer a
-                default ``PassConfig`` when ``pass_config`` is omitted.
+            trainer_config: Optional trainer settings for the default pass
+                configuration and gradient precision.
+                EP gradients follow the trainer's token-weighted loss convention.
             device: Device to place the model and run the graph on. Defaults
                 to the NPU device when available, otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying the
@@ -128,6 +129,14 @@ class GraphCompiler:
         # Set when the PP hybrid mesh registered a "pp" process group; makes
         # ``_build_pass_kwargs`` hand the group name to ``PpPass``.
         self._pp_group_name: Optional[str] = None
+        fsdp_config = getattr(trainer_config, "fsdp_config", None)
+        precision = getattr(fsdp_config, "mix_precision", None)
+        self._reduce_dtype = getattr(precision, "reduce_dtype", None)
+        # TextTrainer's token-weighted loss uses the complete DP domain.
+        # EDP averaging alone omits the expert-parallel part of that domain.
+        self._expert_gradient_scale = (
+            1.0 / getattr(mesh_context, "ep_size", 1) if trainer_config is not None else 1.0
+        )
 
     @staticmethod
     def _resolve_pass_config(
@@ -637,12 +646,15 @@ class GraphCompiler:
         # Live model: partitioning passes (FSDPPass) physically shard
         # parameters in place, keeping the compiler FSDP-agnostic.
         kwargs["model"] = self.model
+        if self._reduce_dtype:
+            kwargs["reduce_dtype"] = getattr(torch, self._reduce_dtype)
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
             if self._expert_param_names:
                 kwargs["expert_param_names"] = self._expert_param_names
                 kwargs["expert_fsdp_group_name"] = "fsdp_expert"
+                kwargs["expert_gradient_scale"] = self._expert_gradient_scale
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
                 kwargs["dp_replicate_group_name"] = "dp_replicate"
