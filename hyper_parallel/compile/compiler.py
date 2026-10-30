@@ -623,6 +623,7 @@ class GraphCompiler:
             if self._expert_param_names:
                 kwargs["expert_param_names"] = self._expert_param_names
                 kwargs["expert_fsdp_group_name"] = "fsdp_expert"
+                kwargs["expert_parallel_degree"] = self._mesh_context.ep_size
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
                 kwargs["dp_replicate_group_name"] = "dp_replicate"
