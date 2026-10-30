@@ -615,6 +615,29 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 replicated = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_reduce"]
                 self.assertEqual([node.args[2] for node in replicated], ["edp"] if degree > 1 else [])
 
+    def test_local_expert_gradient_uses_trainer_scale_after_dtype_conversion(self):
+        """EDP=1 still needs global-mean scaling, while standalone defaults stay unchanged."""
+        for scale in (None, .125):
+            with self.subTest(scale=scale):
+                model = nn.Linear(4, 4)
+                graph = _linear_joint_graph()
+                options = {} if scale is None else {"expert_gradient_scale": scale}
+                with _patch_dist(world_size=8) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+                    mocked.get_world_size.side_effect = lambda group=None: 1 if group == "edp" else 8
+                    FSDPPass().run(
+                        graph, PassConfig(fsdp_degree=8), model=model,
+                        expert_param_names={"weight", "bias"}, expert_fsdp_group_name="edp",
+                        reduce_dtype=torch.float32, **options,
+                    )
+                graph.recompile()
+                gradients = [torch.randn_like(value, dtype=torch.bfloat16) for value in model.parameters()]
+                result = graph(model.weight, model.bias, torch.ones(4), *gradients)
+                for actual, expected in zip(result[1:], gradients):
+                    self.assertEqual(actual.dtype, torch.float32)
+                    torch.testing.assert_close(actual, expected.float() * (scale or 1.), rtol=0, atol=0)
+                self.assertEqual(_count_targets(graph, "all_gather_into_tensor"), 0)
+                self.assertEqual(_count_targets(graph, "reduce_scatter_tensor"), 0)
+
     def test_run_uses_fsdp_degree_from_config_not_world_size(self):
         """Test ``fsdp_degree`` from the config wins over ``world_size``.
 

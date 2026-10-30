@@ -233,6 +233,8 @@ class FSDPPass(GraphPass):
         self._expert_param_names: Set[str] = set()
         self._expert_fsdp_group_name = "fsdp_expert"
         self._expert_fsdp_degree: Optional[int] = None
+        self._reduce_dtype: Optional[torch.dtype] = None
+        self._expert_gradient_scale = 1.0
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -311,7 +313,7 @@ class FSDPPass(GraphPass):
         if classification.unmarked_trainable:
             self._warn_unmarked_trainable(classification.unmarked_trainable)
 
-        if not param_nodes and not classification.replicated_indices:
+        if not param_nodes and not classification.replicated_indices and not self._expert_param_names:
             _LOG.warning(
                 "No DP parameters found, check GraphParallelPlan or model structure"
             )
@@ -359,6 +361,8 @@ class FSDPPass(GraphPass):
         configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
+        self._reduce_dtype = kwargs.get("reduce_dtype")
+        self._expert_gradient_scale = kwargs.get("expert_gradient_scale", 1.0)
         self._expert_param_names = set(kwargs.get("expert_param_names", ()))
         self._expert_fsdp_group_name = kwargs.get("expert_fsdp_group_name", self._expert_fsdp_group_name)
         self._expert_fsdp_degree = (
@@ -946,8 +950,20 @@ class FSDPPass(GraphPass):
             grad_node = new_returned[i]
             if not isinstance(grad_node, fx.Node):
                 continue
-
             state_idx = trainable_state_indices[i - 1]
+
+            if self._reduce_dtype is not None:
+                with graph.inserting_before(output_node):
+                    grad_node = graph.call_method("to", args=(grad_node, self._reduce_dtype))
+                    grad_node.meta["autograd_backward"] = True
+                new_returned[i] = grad_node
+
+            if state_fqns[state_idx] in self._expert_param_names and self._expert_gradient_scale != 1.0:
+                with graph.inserting_before(output_node):
+                    grad_node = graph.call_function(torch.mul, args=(grad_node, self._expert_gradient_scale))
+                    grad_node.meta["autograd_backward"] = True
+                new_returned[i] = grad_node
+
             if state_idx in sharded_param_indices:
                 replicated = False
                 pad_info = self._padded_params.get(state_fqns[state_idx])
