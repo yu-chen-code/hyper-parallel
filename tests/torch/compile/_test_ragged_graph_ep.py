@@ -89,7 +89,7 @@ def _average_gradients(model):
         parameter.grad.copy_(gradient.div_(dist.get_world_size()))
 
 
-def _reference_fsdp_gradient(gradient: torch.Tensor, *, group: object) -> torch.Tensor:
+def _reference_fsdp_gradient(gradient: torch.Tensor, *, group: object, scale: float) -> torch.Tensor:
     """Match eager FSDP's per-backward shard reduction before accumulation.
 
     Reconstructing the full averaged gradient keeps this reference independent
@@ -97,6 +97,7 @@ def _reference_fsdp_gradient(gradient: torch.Tensor, *, group: object) -> torch.
     changes BF16 rounding and models a different synchronization schedule.
     """
     degree = dist.get_world_size(group)
+    gradient = gradient * scale
     shard = gradient.new_empty((gradient.shape[0] // degree, *gradient.shape[1:]))
     dist.reduce_scatter_tensor(shard, gradient.contiguous(), op=dist.ReduceOp.AVG, group=group)
     result = torch.empty_like(gradient, memory_format=torch.contiguous_format)
@@ -109,7 +110,9 @@ def _install_reference_sync(model, expert_mesh):
     handles = []
     for name, parameter in model.named_parameters():
         group = expert_mesh.get_group() if name.startswith("experts.") else dist.group.WORLD
-        handles.append(parameter.register_hook(partial(_reference_fsdp_gradient, group=group)))
+        # Expert dispatch sums EP contributions before EDP averages its independent replicas.
+        scale = expert_mesh.size() / dist.get_world_size() if name.startswith("experts.") else 1.
+        handles.append(parameter.register_hook(partial(_reference_fsdp_gradient, group=group, scale=scale)))
     return handles
 
 

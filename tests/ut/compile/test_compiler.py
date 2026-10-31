@@ -532,6 +532,19 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         comp._pp_group_name = "pp"
         self.assertEqual(comp._build_pass_kwargs()["pp_group_name"], "pp")
 
+    def test_build_pass_kwargs_hands_ep_degree_to_fsdp_pass(self):
+        """Expert loss normalization uses EP, independently of the EDP shard degree."""
+        context = MagicMock(ep_size=4)
+        comp = GraphCompiler(
+            model=_make_model(), train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_degree=4), device=torch.device("cpu"), mesh_context=context,
+        )
+        self.assertNotIn("expert_parallel_degree", comp._build_pass_kwargs())
+        comp._expert_param_names = {"weight"}
+        kwargs = comp._build_pass_kwargs()
+        self.assertEqual(kwargs["expert_parallel_degree"], 4)
+        self.assertEqual(kwargs["expert_fsdp_group_name"], "fsdp_expert")
+
     def test_init_device_mesh_pp_rejects_invalid_topology(self):
         """Test PP rejects an external MeshContext, HSDP, and untiled degrees."""
         cases = (

@@ -548,6 +548,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=2), model=model,
                         expert_param_names={"frozen", "buf"},
+                        expert_parallel_degree=2,
                     )
                 self.assertEqual(tuple(model.trainable.shape), (2, 4))
                 torch.testing.assert_close(model.frozen, torch.ones(3), atol=0, rtol=0)
@@ -575,6 +576,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=4), model=model, fsdp_group_name="dense",
                         expert_param_names={"lin.weight"}, expert_fsdp_group_name="edp",
+                        expert_parallel_degree=4 // degree,
                     )
                 expected_weight = weight[2:] if degree > 1 else weight
                 torch.testing.assert_close(model.lin.weight, expected_weight, atol=0, rtol=0)
@@ -595,6 +597,32 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual([node.args[2] for node in replicated], ["dense"])
                 groups = {node.meta["comm_group"] for node in gm.graph.nodes if "comm_group" in node.meta}
                 self.assertEqual(groups, {"dense", "edp"} if degree > 1 else {"dense"})
+                divisions = [node for node in gm.graph.nodes if node.target == torch.div]
+                self.assertEqual([node.args[1] for node in divisions], [4 // degree])
+                self.assertEqual(divisions[0].args[0].name, "grad_lin_weight")
+
+    def test_expert_only_edp1_normalizes_without_collectives(self):
+        """EP loss averaging also applies when every trainable parameter stays local."""
+        for ep_degree in (2, 4):
+            with self.subTest(ep_degree=ep_degree):
+                model = _OddParam()
+                gm = _odd_joint_graph()
+                output = next(node for node in gm.graph.nodes if node.op == "output")
+                output.args = ([*output.args[0], output.args[0][0]],)
+                gm.loss_dict_keys = ["aux"]
+                with _patch_dist(world_size=ep_degree) as mocked:
+                    mocked.get_world_size.side_effect = (
+                        lambda group=None, degree=ep_degree: degree if group is None else 1
+                    )
+                    FSDPPass().run(
+                        gm, PassConfig(fsdp_degree=ep_degree), model=model,
+                        expert_param_names={"odd"}, expert_parallel_degree=ep_degree,
+                    )
+                loss, gradient, aux = gm(model.odd, torch.ones(4, 1), torch.full_like(model.odd, ep_degree))
+                torch.testing.assert_close(gradient, torch.ones_like(model.odd), rtol=0, atol=0)
+                torch.testing.assert_close(loss, aux, rtol=0, atol=0)
+                self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+                self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
 
     def test_unmarked_expert_fallback_uses_edp_group(self):
         """A partial-plan expert fallback must never reduce across dense/EP peers."""

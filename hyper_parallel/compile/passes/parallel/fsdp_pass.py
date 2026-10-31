@@ -233,6 +233,7 @@ class FSDPPass(GraphPass):
         self._expert_param_names: Set[str] = set()
         self._expert_fsdp_group_name = "fsdp_expert"
         self._expert_fsdp_degree: Optional[int] = None
+        self._expert_parallel_degree = 1
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -311,7 +312,7 @@ class FSDPPass(GraphPass):
         if classification.unmarked_trainable:
             self._warn_unmarked_trainable(classification.unmarked_trainable)
 
-        if not param_nodes and not classification.replicated_indices:
+        if not param_nodes and not classification.replicated_indices and not self._expert_param_names:
             _LOG.warning(
                 "No DP parameters found, check GraphParallelPlan or model structure"
             )
@@ -360,6 +361,7 @@ class FSDPPass(GraphPass):
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
         self._expert_param_names = set(kwargs.get("expert_param_names", ()))
+        self._expert_parallel_degree = kwargs.get("expert_parallel_degree", 1)
         self._expert_fsdp_group_name = kwargs.get("expert_fsdp_group_name", self._expert_fsdp_group_name)
         self._expert_fsdp_degree = (
             dist.get_world_size(_resolve_process_group(self._expert_fsdp_group_name))
@@ -948,6 +950,12 @@ class FSDPPass(GraphPass):
                 continue
 
             state_idx = trainable_state_indices[i - 1]
+            if state_fqns[state_idx] in self._expert_param_names and self._expert_parallel_degree > 1:
+                # Dispatch backward sums EP contributions; EDP AVG alone omits the EP loss replicas.
+                # Normalize before the classification check so EDP=1 is covered without a collective.
+                with graph.inserting_before(output_node):
+                    grad_node = graph.call_function(torch.div, args=(grad_node, self._expert_parallel_degree))
+                new_returned[i] = grad_node
             if state_idx in sharded_param_indices:
                 replicated = False
                 pad_info = self._padded_params.get(state_fqns[state_idx])
