@@ -207,6 +207,13 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         state._init_mp_dtypes()  # pylint: disable=protected-access
         state.param_group._init_all_gather_buckets()  # pylint: disable=protected-access
         for hsdp_param in state.hsdp_params:
+            # Reduction buckets consume forward-materialized parameters.
+            dtype = hsdp_param.param_dtype or hsdp_param.orig_dtype
+            hsdp_param.init_unsharded_param_buffers(
+                [hsdp_param.all_gather_inputs[0].numel()], [dtype], hsdp_param.shard_world_size,
+                torch.device("cpu"),
+            )
+            hsdp_param.init_unsharded_param()
             hsdp_param.unsharded_accumulated_grad = torch.ones(
                 hsdp_param._orig_size,  # pylint: disable=protected-access
                 dtype=hsdp_param.param_dtype or hsdp_param.orig_dtype,
