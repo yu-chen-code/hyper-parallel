@@ -55,6 +55,30 @@ class TestCheckpointManagerSave(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
+    def test_external_state_mapping_preserves_gather_ownership(self) -> None:
+        """Explicit graph-owned state skips gathering; omitted state keeps the original collective."""
+        for main, provided in ((True, True), (False, True), (True, False), (False, False)):
+            with self.subTest(main=main, provided=provided):
+                model = ExportableModel("unregistered_export_test")
+                manager = CheckpointManager(model)
+                state = {"weight": torch.full((2,), 7.0)} if main else {}
+                options = {"state_dict": state} if provided else {}
+                with patch.object(manager, "_is_main_process", return_value=main), \
+                     patch.object(manager, "_gather_full_state_dict", return_value=state) as gather:
+                    if provided:
+                        gather.side_effect = RuntimeError("duplicate gather")
+                    self.assertIs(manager.save_pretrained("/unused", **options), main)
+                if provided:
+                    gather.assert_not_called()
+                else:
+                    gather.assert_called_once_with(keep_state_dict=main)
+                self.assertIs(bool(model.exports), main)
+                if main:
+                    self.assertIs(model.exports[0][2]["state_dict"], state)
+                    self.assertFalse(torch.equal(state["weight"], model.weight))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_hsdp_export_uses_original_class_without_mutating_training_model(self) -> None:
         """Feature: HF checkpoint export.
 
