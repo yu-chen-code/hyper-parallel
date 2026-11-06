@@ -97,3 +97,29 @@ class TestGraphCheckpoint(TestCase):
         self.assertEqual(info.global_shape, (10, 3))
         self.assertEqual(info.chunk.offsets, (8, 0))
         self.assertEqual(info.chunk.sizes, (2, 3))
+
+    def test_restore_preserves_lazy_optimizer_membership(self):
+        """Drop only primed live state, including independently keyed FP32 main parameters."""
+        adapter = _adapter(rank=0)
+        model = adapter.compiler.model
+        main_scalar = torch.nn.Parameter(torch.tensor(2.))
+        zeros = torch.zeros(3, 3)
+        saved = {"exp_avg": zeros}
+        leaf = SimpleNamespace(state={model.weight: saved, main_scalar: {"exp_avg": torch.tensor(0.)},
+                                      "global": {"count": 1}})
+        wrapped = SimpleNamespace(chained_optimizers=[leaf], model_param_by_optimizer_param={main_scalar: model.scalar})
+        plain = SimpleNamespace(state={model.weight: {"exp_avg": zeros}, model.scalar: {"exp_avg": torch.tensor(0.)}})
+        metadata = SimpleNamespace(state_dict_metadata={
+            "optimizer.0.state.weight.exp_avg": object(), "optimizer.1.state.weight.exp_avg": object(),
+            "optimizer.0.mixed_precision_optimizer.fp32_from_fp16_params.scalar": object(),
+        })
+        with patch("hyper_parallel.compile.checkpoint.FileSystemReader") as reader:
+            reader.return_value.load_metadata.return_value = metadata
+            adapter.restore_optimizer_state([wrapped, plain], checkpoint_id="/checkpoint")
+        self.assertIs(leaf.state[model.weight], saved)
+        self.assertEqual(saved["exp_avg"].count_nonzero(), 0)
+        self.assertNotIn(main_scalar, leaf.state)
+        self.assertNotIn(model.scalar, plain.state)
+        self.assertIn(model.weight, plain.state)
+        self.assertEqual(leaf.state["global"], {"count": 1})
+        self.assertEqual(main_scalar, 2)
