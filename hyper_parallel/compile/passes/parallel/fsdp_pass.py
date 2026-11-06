@@ -336,6 +336,8 @@ class FSDPPass(GraphPass):
         self._gradient_reductions: Dict[str, GradientReduction] = {}
         self._source_gradient_groups: Dict[str, str] = {}
         self._parameter_groups: Dict[str, tuple[str, int]] = {}
+        self._storage_prepared = False
+        self._logical_parameter_shapes: Dict[str, tuple] = {}
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -351,6 +353,29 @@ class FSDPPass(GraphPass):
         # ``_classify_dp_params`` and consumed by the all_gather / grad-reduce /
         # live-shard steps so they are pad-sharded like eager ``fully_shard``.
         self._padded_params: Dict[str, _PaddedParam] = {}
+
+    def prepare_model(self, pass_config: PassConfig, **kwargs: Any) -> frozenset[str]:
+        """Partition live storage using the same classification as graph lowering.
+
+        This metadata-only graph does not execute model code or collectives.
+        Call once before building optimizer parameters or loading a checkpoint.
+        """
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return frozenset()
+        model = self._setup_dp_config(pass_config, kwargs)
+        self._reset_run_state()
+        graph = fx.Graph()
+        parameters = list(model.named_parameters())
+        for index, _ in enumerate(parameters):
+            graph.placeholder(f"param_{index}")
+        graph.output(())
+        module = fx.GraphModule({}, graph)
+        names = [name for name, _ in parameters]
+        classification = self._classify_dp_params(module, names, len(names), [True] * len(names), model)
+        if self._dp_mode == "ddp":
+            return frozenset()
+        self._shard_live_model_params(model)
+        return frozenset(node.meta["param_name"] for node in classification.sharded_nodes)
 
     def run(
         self,
@@ -469,6 +494,8 @@ class FSDPPass(GraphPass):
         self._gradient_reductions = dict(kwargs.get("gradient_reductions", {}))
         self._source_gradient_groups = dict(kwargs.get("source_gradient_groups", {}))
         self._parameter_groups = dict(kwargs.get("parameter_groups", {}))
+        self._storage_prepared = kwargs.get("storage_prepared", False)
+        self._logical_parameter_shapes = kwargs.get("logical_parameter_shapes", {})
         if not self._expert_param_names.issubset(self._gradient_reductions):
             raise ValueError("Expert parameters require explicit gradient reduction policies")
         self._expert_fsdp_group_name = kwargs.get(
@@ -565,7 +592,8 @@ class FSDPPass(GraphPass):
             # index in the FSDP group). ``model.parameters()`` then yields the
             # shards, so the trainer's optimizer / grad accumulation stay
             # DP-agnostic; the graph re-gathers each step.
-            self._shard_live_model_params(model)
+            if not self._storage_prepared:
+                self._shard_live_model_params(model)
             annotate_fsdp_bucket_specs(graph_module, model)
 
         return graph_module
@@ -630,6 +658,9 @@ class FSDPPass(GraphPass):
             )
             if skip:
                 continue
+
+            if fqn in self._logical_parameter_shapes:
+                param = torch.empty(self._logical_parameter_shapes[fqn], dtype=param.dtype, device="meta")
 
             _, degree = self._param_group(fqn)
             if fqn in self._expert_param_names and degree == 1:
