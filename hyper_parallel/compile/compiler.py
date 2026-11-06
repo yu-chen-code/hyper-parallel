@@ -169,6 +169,13 @@ class GraphCompiler:
         return self._joint_graph is not None
 
     @property
+    def execution_backend(self) -> Optional[str]:
+        """Actual terminal backend mode; None until a graph is ready."""
+        if self._joint_graph is None:
+            return None
+        return getattr(self._joint_graph.graph_module, "meta", {}).get("inductor_compiled", "fx")
+
+    @property
     def parameter_layouts(self) -> Optional[dict]:
         """Final parameter-identity layouts, available after lazy compilation.
 
@@ -257,9 +264,11 @@ class GraphCompiler:
         # A pass may replace the module, e.g. when installing an executable
         # backend wrapper. Keep its returned graph as the runtime executable.
         runtime_graph = pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        if getattr(runtime_graph, "meta", {}).get("inductor_compiled") == "unavailable":
+            raise RuntimeError("The requested joint-graph Inductor backend is unavailable in this torch build")
         for name in (
             "state_fqns", "state_is_param", "num_state_inputs", "user_inputs_spec",
-            "loss_dict_keys", "fsdp_sharded_param_names",
+            "loss_dict_keys", "fsdp_sharded_param_names", "meta",
         ):
             if not hasattr(runtime_graph, name) and hasattr(joint_graph.graph_module, name):
                 setattr(runtime_graph, name, getattr(joint_graph.graph_module, name))
@@ -270,6 +279,7 @@ class GraphCompiler:
         if joint_graph.state_guards is not None:
             joint_graph.state_guards.refresh(self.model)
         self._joint_graph = joint_graph
+        _LOG.info("Joint graph ready: execution_backend=%s", self.execution_backend)
 
     def forward_backward(self, **inputs: Any) -> Any:
         """

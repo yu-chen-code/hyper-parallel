@@ -569,6 +569,10 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        fsdp_bucketing=getattr(compile_config, "fsdp_bucketing", False),
+        fsdp_bucket_modules=getattr(compile_config, "fsdp_bucket_modules", None),
+        inductor_mode=getattr(compile_config, "inductor_mode", "off"),
+        inductor_configs=getattr(compile_config, "inductor_configs", None),
         ac_mode=ac_mode,
         ac_layer_count=ac_layer_count,
         ac_layer_indices=ac_layer_indices,
