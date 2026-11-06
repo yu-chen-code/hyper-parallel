@@ -52,12 +52,11 @@ class TestRaggedExperts(unittest.TestCase):
     """Reject unsupported meshes and retain exact expert ownership."""
 
     def test_compile_rejects_unsupported_ep_topologies(self):
-        """Reject extra parallel axes and overlap before tracing or communication."""
-        for axis in ("tp_size", "cp_size", "pp_size"):
-            context = MeshContext(ep_size=2, **{axis: 2})
-            compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=False), mesh_context=context)
-            with self.subTest(axis=axis), self.assertRaisesRegex(ValueError, "TP=CP=PP=1"):
-                compiler.compile()
+        """Reject pipelining and EP overlap before tracing or communication."""
+        compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=False),
+                                 mesh_context=MeshContext(ep_size=2, pp_size=2))
+        with self.assertRaisesRegex(ValueError, "PP=1"):
+            compiler.compile()
         compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=True),
                                  mesh_context=MeshContext(ep_size=2))
         with self.assertRaisesRegex(ValueError, "enable_overlap=False"):

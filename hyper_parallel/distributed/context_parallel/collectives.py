@@ -39,13 +39,15 @@ hyper_parallel/data/parallel/batch_parallel.py.
 # pylint: disable=missing-apache-license-header
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 from torch import Tensor  # pylint: disable=forbidden-backend-import
+from torch.distributed import _functional_collectives
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather  # pylint: disable=forbidden-backend-import
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.utils import communication
+from hyper_parallel.core.utils.communication import _is_tracing_or_compiling
 
 
 _ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
@@ -360,11 +362,31 @@ class AsyncCPCollective:
         raise RuntimeError(f"unknown async CP collective kind {self.kind!r}")
 
 
+@dataclass
+class _FunctionalCPCollective:
+    """Keep a captured collective as tensors until its consumer materializes it."""
+
+    output: Tensor
+    dimension: int
+    all_to_all: bool = False
+    waited: bool = False
+
+    def wait(self) -> Tensor:
+        """Wait on the functional result and restore its logical tensor layout."""
+        if self.waited:
+            raise RuntimeError("an async CP collective handle cannot be waited twice")
+        self.waited = True
+        output = _functional_collectives.wait_tensor(self.output)
+        if self.all_to_all:
+            return _reconstruct_all_to_all(output, self.dimension)
+        return _move_dim_from_front(output, self.dimension)
+
+
 def async_cp_allgather_launch(
     tensor: Tensor,
     gather_dim: int,
     cp_mesh: DeviceMesh,
-) -> AsyncCPCollective:
+) -> Union[AsyncCPCollective, _FunctionalCPCollective]:
     """Launch an asynchronous all-gather along gather_dim."""
     world_size = cp_mesh.size()
     if world_size <= 1:
@@ -372,6 +394,10 @@ def async_cp_allgather_launch(
             tensor, None, tensor, None, world_size, "allgather", gather_dim
         )
     gather_dim = _normalize_dim(gather_dim, tensor.dim())
+    if _is_tracing_or_compiling():
+        send = _move_dim_to_front(tensor, gather_dim)
+        output = _functional_collectives.all_gather_single(send, 0, cp_mesh.get_group())
+        return _FunctionalCPCollective(output, gather_dim)
     send = _move_dim_to_front(tensor.detach(), gather_dim)
     output_shape = list(send.shape)
     output_shape[0] *= world_size
@@ -392,7 +418,7 @@ def async_ulysses_seq_to_head_launch(
     seq_dim: int,
     head_dim: int,
     cp_mesh: DeviceMesh,
-) -> AsyncCPCollective:
+) -> Union[AsyncCPCollective, _FunctionalCPCollective]:
     """Launch an asynchronous Ulysses sequence-to-head A2A."""
     world_size = cp_mesh.size()
     if world_size <= 1:
@@ -410,6 +436,10 @@ def async_ulysses_seq_to_head_launch(
     head_dim = _normalize_dim(head_dim, tensor.dim())
     if seq_dim == head_dim:
         raise ValueError("Ulysses seq_dim and head_dim must be different")
+    if _is_tracing_or_compiling():
+        send = _prepare_ulysses_send(tensor, scatter_dim=head_dim, world_size=world_size)
+        output = _functional_collectives.all_to_all_single(send, None, None, cp_mesh.get_group())
+        return _FunctionalCPCollective(output, seq_dim, all_to_all=True)
     send = _prepare_ulysses_send(
         tensor.detach(), scatter_dim=head_dim, world_size=world_size
     )
