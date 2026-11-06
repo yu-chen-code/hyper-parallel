@@ -45,10 +45,12 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.external_state import get_model_external_state
 
 from .graph_parallel_plan import GraphParallelPlan
+from .mixed_precision import GraphMixedPrecision
 from .pass_config import (
     GradientReduction,
     PassConfig,
@@ -141,6 +143,8 @@ class GraphCompiler:
         self._storage_signature = None
         self._sharded_parameter_names = frozenset()
         self._prepared_pass_kwargs = None
+        self._mixed_precision = None
+        self._fp32_main_params = getattr(getattr(trainer_config, "optimizer", None), "fp32_main_params", False)
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -242,6 +246,12 @@ class GraphCompiler:
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             self._init_device_mesh(self._mesh_context)
         self._bind_parameter_meshes()
+        precision = getattr(self._fsdp_config, "mix_precision", None)
+        if precision is not None and any((precision.param_dtype, precision.reduce_dtype, precision.output_dtype,
+                                          precision.custom_params, self._fp32_main_params)):
+            manager = FSDP2Manager(self._fsdp_config, self._mesh_context or MeshContext(), self._fp32_main_params)
+            policy, modules = manager.mixed_precision_bindings(self.model, self.source_shard_info)
+            self._mixed_precision = GraphMixedPrecision(self.model, policy, modules)
         self._parameter_shapes = {
             name: tuple(param.shape) for name, param in self.model.named_parameters(remove_duplicate=False)
         }
@@ -284,7 +294,7 @@ class GraphCompiler:
         if self.pass_config.ac_mode != "off":
             ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)
 
-        trace_kwargs = {"state_shapes": self._parameter_shapes}
+        trace_kwargs = {"state_shapes": self._parameter_shapes, "mixed_precision": self._mixed_precision}
         if self.dynamic or self.dynamic_arg_dims is not None:
             trace_kwargs.update({
                 "dynamic": self.dynamic,
@@ -870,6 +880,8 @@ class GraphCompiler:
         # Live model: partitioning passes (FSDPPass) physically shard
         # parameters in place, keeping the compiler FSDP-agnostic.
         kwargs["model"] = self.model
+        if self._mixed_precision is not None:
+            kwargs["parameter_dtypes"] = self._mixed_precision.parameter_dtypes
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
@@ -977,13 +989,18 @@ class GraphCompiler:
             )
 
         for param, grad in zip(trainable, grads):
-            if param.grad is None:
+            main_grad = self._mixed_precision is not None and self._mixed_precision.policy.apply_grad_on_fp32_main_grad
+            attribute = "main_grad" if main_grad else "grad"
+            accumulated = getattr(param, attribute, None)
+            if accumulated is None:
                 # Match eager's gradient layout so optimizer kernels see the
                 # parameter's strides rather than a backward matmul's view.
-                param.grad = torch.empty_like(param)
-                param.grad.copy_(grad)
+                dtype = torch.float32 if main_grad else param.dtype
+                accumulated = torch.empty_like(param, dtype=dtype)
+                accumulated.copy_(grad)
+                setattr(param, attribute, accumulated)
             else:
-                param.grad += grad
+                accumulated += grad
 
     @staticmethod
     def _trainable_params_in_state_order(

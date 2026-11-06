@@ -59,7 +59,7 @@ import inspect
 import warnings
 from collections.abc import Callable, Generator
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -443,6 +443,7 @@ def _make_fwd_bwd_fn(
     state_is_param: list[bool],
     state_spec: Any,
     user_inputs_spec: Any,
+    mixed_precision: Any = None,
 ) -> tuple[Callable, list[str]]:
     """Build the joint callable and its named-loss output metadata."""
     num_state_inputs = len(state_fqns)
@@ -458,9 +459,10 @@ def _make_fwd_bwd_fn(
         user_args = torch.utils._pytree.tree_unflatten(
             list(user_wrapped), user_inputs_spec
         )
+        model_state = mixed_precision.cast_state(state_t["model"]) if mixed_precision else state_t["model"]
 
         with (
-            _reparametrize_train_state(model, state_t["model"]),
+            _reparametrize_train_state(model, model_state),
             _patch_engine_backward(),
         ):
             out = train_fn(model, **user_args)
@@ -483,12 +485,12 @@ def _make_fwd_bwd_fn(
             else:
                 loss, loss_dict_keys, loss_dict_values = out, [], []
 
-            # Read params from state_t["model"] so the exact trace-time
-            # tensors (not the live module's) drive autograd.grad.
+            # Like eager FSDP, differentiate compute parameters. Casting back
+            # to storage here could round gradients before their reduction.
             params = []
             for idx, fqn in enumerate(state_fqns):
                 if state_is_param[idx]:
-                    param = state_t["model"][fqn]
+                    param = model_state[fqn]
                     if param.requires_grad:
                         params.append(param)
 
@@ -515,6 +517,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     dynamic: bool = False,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
     state_shapes: dict[str, tuple] | None = None,
+    mixed_precision: Any = None,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -529,6 +532,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             Providing a mapping enables selective symbolic tracing, even when dynamic is False.
             Parameters and buffers always remain static.
         state_shapes: Source-local logical parameter shapes before live FSDP slicing.
+        mixed_precision: Resolved shared FSDP precision policy and module cast boundaries.
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -577,7 +581,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             ) + fake_args[num_state_inputs:]
 
     _fwd_bwd_fn, loss_dict_keys_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
-        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
+        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec, mixed_precision
     )
 
     # make_fx only records ``nn_module_stack`` when the traced callable
@@ -592,6 +596,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     ctx = TracingContext(fake_mode)
     with (
         fake_mode,
+        mixed_precision.module_casts() if mixed_precision else nullcontext(),
         tracing(ctx),
         preserve_node_meta(),
         _skip_nested_compile(),
