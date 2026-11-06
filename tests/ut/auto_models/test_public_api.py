@@ -212,6 +212,10 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("inductor_mode", "'off'"),
+                ("inductor_configs", "None"),
+                ("fsdp_bucketing", "False"),
+                ("fsdp_bucket_modules", "None"),
             ],
         )
 

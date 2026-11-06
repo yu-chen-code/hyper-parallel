@@ -439,6 +439,15 @@ class FSDPPass(GraphPass):
             len(param_nodes),
         )
 
+        # Backend propagation starts from runtime shard inputs, rather than the
+        # full logical tensors used to capture the forward/backward operators.
+        parameters = dict(model.named_parameters())
+        for node in param_nodes:
+            value = node.meta.get("val")
+            parameter = parameters.get(node.meta.get("param_name"))
+            if isinstance(value, torch.Tensor) and parameter is not None:
+                node.meta["val"] = value.new_empty(parameter.shape, requires_grad=value.requires_grad)
+
         graph_module.recompile()
         return graph_module
 
