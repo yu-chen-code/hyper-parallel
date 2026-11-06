@@ -254,12 +254,21 @@ class GraphCompiler:
         if ac_scope is not None:
             pass_kwargs["ac_scope"] = ac_scope
 
-        # Passes mutate ``graph_module`` in place and return it, so the
-        # transformed graph lives on ``joint_graph`` for ``forward_backward``.
-        pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        # A pass may replace the module, e.g. when installing an executable
+        # backend wrapper. Keep its returned graph as the runtime executable.
+        runtime_graph = pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        for name in (
+            "state_fqns", "state_is_param", "num_state_inputs", "user_inputs_spec",
+            "loss_dict_keys", "fsdp_sharded_param_names",
+        ):
+            if not hasattr(runtime_graph, name) and hasattr(joint_graph.graph_module, name):
+                setattr(runtime_graph, name, getattr(joint_graph.graph_module, name))
+        joint_graph.graph_module = runtime_graph
 
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
+        if joint_graph.state_guards is not None:
+            joint_graph.state_guards.refresh(self.model)
         self._joint_graph = joint_graph
 
     def forward_backward(self, **inputs: Any) -> Any:
