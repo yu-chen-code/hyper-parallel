@@ -830,12 +830,12 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                 model.experts.local_expert_count = 2
                 context = MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert,
                                       dp_size=8, dp_shard_size=8, ep_size=ep, edp_shard_size=8 // ep)
-                compiler = GraphCompiler(model, _mse_train_fn, mesh_context=context)
+                compiler = GraphCompiler(model, _mse_train_fn, PassConfig(enable_overlap=False), mesh_context=context)
                 with patch.object(compiler, "_register_mesh_group"):
                     compiler._init_device_mesh(context)
                 compiler._bind_parameter_meshes()
                 self.assertEqual(compiler._parameter_meshes, {})
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 layouts = compiler.parameter_layouts
                 self.assertEqual(layouts[model.dense].mesh.mesh_dim_names, ("fsdp_shard",))
                 expert_layout = layouts[model.experts.weight]
@@ -853,7 +853,7 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                 context = MeshContext(device_mesh=mesh, dp_replicate_size=replicate, dp_shard_size=2)
                 model = _make_model()
                 compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False), mesh_context=context)
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 with patch.object(compiler, "_register_mesh_group") as register:
                     layout = compiler.parameter_layouts[model.weight]
                 register.assert_not_called()
@@ -876,7 +876,7 @@ class TestParameterLayoutMeshFallback(unittest.TestCase):
                     compiler._init_device_mesh(context)
                 expected = ("dp",) if world_only else ("fsdp_replicate", "fsdp_shard")
                 self.assertEqual(compiler._fsdp_mesh.mesh_dim_names, expected)
-                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                compiler.prepare_model()
                 layout_names = expected if world_only else (*expected, "tp")
                 self.assertEqual(compiler.parameter_layouts[model.weight].mesh.mesh_dim_names, layout_names)
 

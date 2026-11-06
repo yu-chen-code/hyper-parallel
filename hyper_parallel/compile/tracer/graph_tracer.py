@@ -514,6 +514,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     *,
     dynamic: bool = False,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+    state_shapes: dict[str, tuple] | None = None,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -527,6 +528,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
             Providing a mapping enables selective symbolic tracing, even when dynamic is False.
             Parameters and buffers always remain static.
+        state_shapes: Source-local logical parameter shapes before live FSDP slicing.
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -566,6 +568,13 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv(), static_shapes=True)
         fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
     num_state_inputs = len(state_flat)
+    if state_shapes:
+        with fake_mode:
+            fake_args = tuple(
+                value.new_empty(state_shapes[name], requires_grad=value.requires_grad)
+                if name in state_shapes and tuple(value.shape) != state_shapes[name] else value
+                for name, value in zip(state_fqns, fake_args[:num_state_inputs])
+            ) + fake_args[num_state_inputs:]
 
     _fwd_bwd_fn, loss_dict_keys_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
         model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
@@ -631,7 +640,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 
     param_names = [name for name, _ in model.named_parameters() if _.requires_grad]
     param_shapes = {
-        name: tuple(param.shape) for name, param in model.named_parameters()
+        name: (state_shapes or {}).get(name, tuple(param.shape)) for name, param in model.named_parameters()
     }
 
     num_layers = 0

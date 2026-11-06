@@ -57,6 +57,7 @@ from .pass_config import (
 )
 from .passes.pipeline import PassPipeline
 from .passes.activation_checkpoint import prepare_activation_checkpoint
+from .passes.parallel.fsdp_pass import FSDPPass
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -135,6 +136,11 @@ class GraphCompiler:
         self._parameter_shapes = {}
         self._parameter_layouts = None
         self._layout_signature = None
+        self._storage_ready = False
+        self._storage_failed = False
+        self._storage_signature = None
+        self._sharded_parameter_names = frozenset()
+        self._prepared_pass_kwargs = None
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -170,20 +176,80 @@ class GraphCompiler:
 
     @property
     def parameter_layouts(self) -> Optional[dict]:
-        """Final parameter-identity layouts, available after lazy compilation.
+        """Final parameter-identity layouts, available after storage preparation.
 
         Cache metadata only: gradients may be replaced on every optimizer step.
         Replacing a parameter invalidates the mapping, as does compiling again.
         """
-        if self._joint_graph is None:
+        if not self._storage_ready:
             return None
         parameters = dict(self.model.named_parameters())
         signature = tuple((id(param), tuple(param.shape), param.dtype, param.device) for param in parameters.values())
         if signature != self._layout_signature:
             self._parameter_layouts = self._build_parameter_layouts(parameters)
             self._layout_signature = signature
-            self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
+            if self._joint_graph is not None:
+                self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
         return self._parameter_layouts
+
+    @property
+    def parameter_shapes(self) -> dict:
+        """Source-local logical shapes before FSDP padding and slicing."""
+        return dict(self._parameter_shapes)
+
+    @property
+    def sharded_parameter_names(self) -> frozenset:
+        """Canonical names of parameters physically partitioned by FSDP."""
+        return self._sharded_parameter_names
+
+    def prepare_model(self) -> None:
+        """Prepare local parameter storage once, before optimizer construction.
+
+        Values may subsequently be loaded or updated in place. Changing a
+        parameter identity, shape, dtype or device requires a new model and
+        compiler. A failed preparation is terminal because storage may have
+        already been partitioned.
+        """
+        external = get_model_external_state(self.model)
+        if external is not None and external.parameters:
+            raise ValueError("GraphCompiler does not support externally managed parameters yet")
+        if self._storage_failed:
+            raise RuntimeError("Graph storage preparation failed; rebuild the model and compiler")
+        signature = self._model_storage_signature()
+        if self._storage_ready:
+            if signature != self._storage_signature:
+                raise ValueError("Prepared graph parameter storage changed; rebuild the model and compiler")
+            return
+        try:
+            self._prepare_model_storage()
+        except Exception:
+            self._storage_failed = True
+            raise
+        self._storage_signature = self._model_storage_signature()
+        self._storage_ready = True
+
+    def _model_storage_signature(self) -> tuple:
+        """Describe storage identity without retaining any parameter values."""
+        return tuple((name, id(param), tuple(param.shape), param.dtype, param.device, param.requires_grad)
+                     for name, param in self.model.named_parameters(remove_duplicate=False))
+
+    def _prepare_model_storage(self) -> None:
+        """Reuse FSDP ownership and slicing before creating optimizer state."""
+        self._validate_ep_topology()
+        tp_size = getattr(self._mesh_context, "tp_size", 1)
+        if isinstance(tp_size, int) and tp_size > 1 and not self.source_shard_info:
+            raise ValueError("Graph TP requires source_shard_info from the sharding plan")
+        if self.pass_config.fsdp_enabled and dist.is_initialized():
+            self._init_device_mesh(self._mesh_context)
+        self._bind_parameter_meshes()
+        self._parameter_shapes = {
+            name: tuple(param.shape) for name, param in self.model.named_parameters(remove_duplicate=False)
+        }
+        self._prepared_pass_kwargs = self._build_pass_kwargs()
+        if self.pass_config.fsdp_enabled:
+            fsdp = FSDPPass(parallel_plan=self.parallel_plan)
+            self._sharded_parameter_names = fsdp.prepare_model(self.pass_config, **self._prepared_pass_kwargs)
+        self._layout_signature = None
 
     def compile(self, **inputs: Any) -> None:
         """
@@ -209,20 +275,7 @@ class GraphCompiler:
         if self._pytree_pre_hook is not None:
             self._pytree_pre_hook()
 
-        self._validate_ep_topology()
-        if (
-            isinstance(getattr(self._mesh_context, "tp_size", None), int)
-            and self._mesh_context.tp_size > 1
-            and not self.source_shard_info
-        ):
-            raise ValueError("Graph TP requires source_shard_info from the sharding plan")
-
-        if self.pass_config.fsdp_enabled and dist.is_initialized():
-            # Only build the FSDP mesh when distributed is actually up.
-            # ``FSDPPass`` early-returns when ``world_size == 1``, so a
-            # single-process run (no dist, or a single rank) compiles and
-            # runs as plain graph mode without sharding.
-            self._init_device_mesh(self._mesh_context)
+        self.prepare_model()
 
         # Activation checkpointing must resolve its scope and run the adapter's
         # runtime hook BEFORE tracing: the hook configures state the model's
@@ -231,23 +284,20 @@ class GraphCompiler:
         if self.pass_config.ac_mode != "off":
             ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)
 
-        self._bind_parameter_meshes()
-        self._parameter_shapes = {name: tuple(param.shape) for name, param in self.model.named_parameters()}
-        self._layout_signature = None
-
-        trace_kwargs = {}
+        trace_kwargs = {"state_shapes": self._parameter_shapes}
         if self.dynamic or self.dynamic_arg_dims is not None:
-            trace_kwargs = {
+            trace_kwargs.update({
                 "dynamic": self.dynamic,
                 "dynamic_arg_dims": self.dynamic_arg_dims,
-            }
+            })
         joint_graph = trace_model_graph(
             self.model, self.train_fn, inputs, **trace_kwargs
         )
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
-        pass_kwargs = self._build_pass_kwargs()
+        pass_kwargs = dict(self._prepared_pass_kwargs)
+        pass_kwargs["storage_prepared"] = True
         # Terminal backend compilation (InductorPass) sizes its regions from
         # the tracer's fake example inputs; every other pass ignores them.
         pass_kwargs["example_inputs"] = joint_graph.example_inputs
@@ -334,7 +384,7 @@ class GraphCompiler:
         if self._fsdp_mesh is None and context is not None:
             # Plain graph mode still needs metadata, without creating collectives.
             self._init_mesh_from_context(context, self.pass_config.dp_mode, register_groups=False)
-        sharded = getattr(self._joint_graph.graph_module, "fsdp_sharded_param_names", frozenset())
+        sharded = self._sharded_parameter_names
         layouts = {}
         for name, parameter in parameters.items():
             if not parameter.requires_grad:
@@ -812,7 +862,10 @@ class GraphCompiler:
         """
         Build kwargs to pass to passes.
         """
-        kwargs = {}
+        kwargs = {
+            "storage_prepared": self._storage_ready,
+            "logical_parameter_shapes": self._parameter_shapes,
+        }
 
         # Live model: partitioning passes (FSDPPass) physically shard
         # parameters in place, keeping the compiler FSDP-agnostic.
