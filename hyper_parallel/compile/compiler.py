@@ -244,6 +244,7 @@ class GraphCompiler:
         joint_graph = trace_model_graph(
             self.model, self.train_fn, inputs, **trace_kwargs
         )
+        self._validate_gradient_usage(joint_graph.graph_module)
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
@@ -261,6 +262,34 @@ class GraphCompiler:
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
+
+    def _validate_gradient_usage(self, graph_module: torch.fx.GraphModule) -> None:
+        """Admit a fixed parameter-usage schema before parallel graph lowering.
+
+        Every participating rank must capture the same state names and unused
+        slots. This conservative contract rejects rank-dependent usage instead
+        of allowing different collective sequences; it does not merge gradients
+        between distinct EP owners. Validation communicates once at compilation.
+        """
+        output = next(node for node in graph_module.graph.nodes if node.op == "output")
+        returned = output.args[0]
+        end = len(returned) - len(getattr(graph_module, "loss_dict_keys", []))
+        gradients = returned[1:end]
+        parameters = dict(self.model.named_parameters(remove_duplicate=False))
+        names = tuple(name for name in graph_module.state_fqns
+                      if name in parameters and parameters[name].requires_grad)
+        if len(names) != len(gradients):
+            raise ValueError("Graph gradient slots must match the trainable parameter schema")
+        schema = (tuple(graph_module.state_fqns), tuple(zip(names, (grad is None for grad in gradients))))
+        if (self.pass_config.fsdp_enabled or self.pass_config.pp_enabled) and dist.is_initialized():
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                schemas = [None] * world_size
+                dist.all_gather_object(schemas, schema)
+                if any(other != schema for other in schemas):
+                    raise ValueError("Graph training requires the same parameter usage schema on every rank")
+        if self.pass_config.pp_enabled and any(unused for _, unused in schema[1]):
+            raise ValueError("Graph pipeline parallel does not support unused parameter gradients yet")
 
     def forward_backward(self, **inputs: Any) -> Any:
         """
@@ -893,7 +922,7 @@ class GraphCompiler:
             inputs,
         )
 
-    def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:
+    def _accumulate_grads(self, grads: List[Optional[torch.Tensor]]) -> None:
         """Accumulate graph-computed gradients into the live model's parameters.
 
         The graph emits gradients in ``state_fqns`` order (trainable
@@ -924,6 +953,8 @@ class GraphCompiler:
             )
 
         for param, grad in zip(trainable, grads):
+            if grad is None:
+                continue
             if param.grad is None:
                 # Match eager's gradient layout so optimizer kernels see the
                 # parameter's strides rather than a backward matmul's view.
