@@ -24,6 +24,7 @@ from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
+from torch.utils._pytree import register_pytree_node
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,75 @@ def compressed_owner_offsets(boundaries: tuple[int, ...], ratio: int, local_leng
     return (*offsets, keys[-1])
 
 
+def _pool_blocks(projected: torch.Tensor, rows: torch.Tensor, count: int, ratio: int) -> torch.Tensor:
+    """Apply the original document-local FP32 softmax to prepared block rows."""
+    blocks = projected.index_select(1, rows).reshape(projected.shape[0], count, ratio, projected.shape[-1])
+    values, scores = blocks.chunk(2, dim=-1)
+    return (values * scores.float().softmax(dim=2).to(values.dtype)).sum(dim=2)
+
+
+@dataclass(frozen=True)
+class PreparedCompressionPlan:
+    """Read-only CP1 compression indices supplied as runtime graph inputs.
+
+    The ratio is static model configuration. Row values and the number of
+    complete blocks may change between batches without Python document loops.
+    """
+
+    ratio: int
+    rows: torch.Tensor
+    block_positions: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Validate the tensor schema without reading any index values."""
+        if not isinstance(self.ratio, int) or self.ratio <= 1:
+            raise ValueError("Prepared compression requires an integer ratio greater than one")
+        if self.rows.ndim != 1 or self.block_positions.ndim != 1:
+            raise ValueError("Prepared compression indices must be one-dimensional")
+        if self.rows.dtype != torch.long or self.block_positions.dtype != torch.long:
+            raise ValueError("Prepared compression indices must use int64")
+        if self.rows.numel() != self.block_positions.numel() * self.ratio:
+            raise ValueError("Prepared compression rows do not match the complete block count")
+
+    @staticmethod
+    def _validate_context(context: Any) -> None:
+        """Reject CP communication until its tensor routing metadata is supported."""
+        if context is not None and getattr(context, "size", 1) != 1:
+            raise ValueError("Prepared graph compression currently requires CP=1")
+
+    @classmethod
+    def pytree_unflatten(cls, children: Any, context: tuple) -> PreparedCompressionPlan:
+        """Restore tensor leaves without interpreting their document-boundary values."""
+        return cls(context[0], *children)
+
+    def pool(self, key: torch.Tensor, gate: torch.Tensor, context: Any = None) -> torch.Tensor:
+        """Pool complete same-document groups with the eager compressor's math.
+
+        Args:
+            key: Projected values shaped [batch, raw tokens, channels].
+            gate: Pooling logits with the same shape as key.
+            context: None or a single-rank CP context.
+
+        Returns:
+            Pooled values for this batch's complete document-local blocks.
+        """
+        self._validate_context(context)
+        return _pool_blocks(torch.cat((key, gate), dim=-1), self.rows, self.block_positions.numel(), self.ratio)
+
+    def positions(self, cos: torch.Tensor, sin: torch.Tensor, context: Any = None) -> tuple:
+        """Select original block-start rotary coefficients without changing dtype."""
+        self._validate_context(context)
+        return torch.cat((cos, sin), dim=-1).index_select(1, self.block_positions).chunk(2, dim=-1)
+
+    def pytree_flatten(self) -> tuple[list[torch.Tensor], tuple]:
+        """Keep only the model's ratio static; every batch-dependent index is a tensor."""
+        return [self.rows, self.block_positions], (self.ratio,)
+
+
+register_pytree_node(PreparedCompressionPlan, PreparedCompressionPlan.pytree_flatten,
+                    PreparedCompressionPlan.pytree_unflatten)
+
+
 @dataclass(frozen=True)
 class DocumentCompressionPlan:
     """Immutable block ranges; never enumerate the full sequence on the CPU."""
@@ -103,6 +173,23 @@ class DocumentCompressionPlan:
     counts: tuple[int, ...]
     local_blocks: tuple[tuple[int, int], ...]
     route: CompressionBoundaryRoute
+
+    def prepare(self, device: torch.device) -> PreparedCompressionPlan:
+        """Materialize graph input tensors before capture, using the existing CPU plan.
+
+        Args:
+            device: Device on which the model will consume the block indices.
+
+        Returns:
+            Tensor-only indices for complete document-local compression blocks.
+
+        Raises:
+            ValueError: When the plan includes a multi-rank CP routing contract.
+        """
+        if len(self.counts) != 1 or self.route.needs_exchange:
+            raise ValueError("Prepared graph compression currently requires CP=1")
+        rows, positions = self.indices(device)
+        return PreparedCompressionPlan(self.ratio, rows, positions)
 
     def indices(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Reuse device indices for local blocks and their original rotary positions.
@@ -144,11 +231,7 @@ class DocumentCompressionPlan:
         """
         rows = self.indices(key.device)[0]
         projected = self.exchange(torch.cat((key, gate), dim=-1), context)
-        blocks = projected.index_select(1, rows).reshape(
-            key.shape[0], self.counts[self.rank], self.ratio, projected.shape[-1],
-        )
-        values, scores = blocks.chunk(2, dim=-1)
-        return (values * scores.float().softmax(dim=2).to(values.dtype)).sum(dim=2)
+        return _pool_blocks(projected, rows, self.counts[self.rank], self.ratio)
 
     def positions(self, cos: torch.Tensor, sin: torch.Tensor, context: Any) -> tuple:
         """Take original block-start RoPE; retain FP32 boundary metadata precision.
