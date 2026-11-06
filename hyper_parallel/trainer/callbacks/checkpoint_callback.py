@@ -663,7 +663,7 @@ class CheckpointerCallback(Callback):
         return self._graph_checkpoint_payload(checkpoint_state), optimizers
 
     def _load_optimizer_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
-                                persisted_keys: Optional[frozenset[str]]) -> None:
+                                persisted_keys: Optional[frozenset[str]], checkpoint_id: Optional[str] = None) -> None:
         """Restore dense optimizer leaves or reload dense main parameters."""
         optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
         for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
@@ -671,6 +671,9 @@ class CheckpointerCallback(Callback):
             drop_primed = getattr(optimizer, "drop_unpersisted_dense_state", None)
             if drop_primed is not None and persisted_keys is not None:
                 drop_primed(persisted_keys)
+        compiler = getattr(self.trainer, "graph_compiler", None)
+        if compiler is not None and checkpoint_id is not None and optimizers:
+            GraphCheckpointAdapter(compiler).restore_optimizer_state(optimizers, checkpoint_id=checkpoint_id)
         if not optimizers:
             for optimizer in _as_list(self.trainer.optimizer):
                 if isinstance(optimizer, MixedPrecisionOptimizer):
@@ -698,7 +701,7 @@ class CheckpointerCallback(Callback):
             self.trainer.config.model_init_dtype,
         )
         persisted_keys = load_plan.persisted_optimizer_keys if load_plan is not None else None
-        self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys)
+        self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys, checkpoint_id=restore_path)
 
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])

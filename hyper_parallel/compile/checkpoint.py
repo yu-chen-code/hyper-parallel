@@ -22,6 +22,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.distributed_checkpoint import FileSystemReader
 from hyper_parallel.core.distributed_checkpoint.metadata import CHUNK_INFO, ChunkInfo, ChunkStorageMetadata
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
@@ -92,6 +93,29 @@ class GraphCheckpointAdapter:
     def restore(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Restore physical padding before the existing model/optimizer loaders run."""
         return self._map(payload, restoring=True)
+
+    def restore_optimizer_state(self, optimizers: list[Any], *, checkpoint_id: str) -> None:
+        """Remove priming-only slots after the standard strict optimizer load.
+
+        Args:
+            optimizers: Loaded optimizer runtimes, in checkpoint payload order.
+            checkpoint_id: Actual DCP directory whose metadata records persisted state.
+        """
+        metadata = FileSystemReader(checkpoint_id).load_metadata()
+        persisted = set()
+        for name in metadata.state_dict_metadata:
+            if name.startswith("optimizer."):
+                while name:
+                    persisted.add(name)
+                    name = name.rpartition(".")[0]
+        for index, optimizer in enumerate(optimizers):
+            prefix = f"optimizer.{index}" if len(optimizers) > 1 else "optimizer"
+            owners = getattr(optimizer, "model_param_by_optimizer_param", {})
+            for leaf in getattr(optimizer, "chained_optimizers", (optimizer,)):
+                for parameter in list(leaf.state):
+                    name = self.canonical_names.get(id(owners.get(parameter, parameter)))
+                    if name in self.parameters and f"{prefix}.state.{name}" not in persisted:
+                        del leaf.state[parameter]
 
     def _owner(self, key: Any, current: str | None) -> str | None:
         """Resolve ordinary, flattened optimizer and main-weight FQN keys."""
