@@ -75,6 +75,7 @@ class CheckpointManager:
         *,
         max_shard_size: int | str = "5GB",
         save_original_format: bool | None = None,
+        state_dict: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> bool:
         """Gather model weights and save a Transformers-compatible checkpoint.
@@ -87,6 +88,8 @@ class CheckpointManager:
             max_shard_size: Maximum size of each Hugging Face weight shard.
             save_original_format: Whether to reverse registered weight conversions.
                 None uses the adapter default, or True when no adapter specifies one.
+            state_dict: Optional full model state gathered by an external storage owner.
+                All ranks supply a mapping; non-writing ranks may supply an empty mapping.
             **kwargs: Additional arguments forwarded to ``save_pretrained``.
 
         Returns:
@@ -96,7 +99,8 @@ class CheckpointManager:
         if not callable(save_method):
             raise TypeError("CheckpointManager.save_pretrained requires a Transformers model")
         is_main_process = self._is_main_process()
-        state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
+        if state_dict is None:
+            state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
         export_model = self._hf_export_model()
