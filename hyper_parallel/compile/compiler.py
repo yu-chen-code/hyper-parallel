@@ -496,14 +496,12 @@ class GraphCompiler:
         self.pass_config.fsdp_degree = world_size
 
     def _validate_ep_topology(self) -> None:
-        """Limit graph EP to the synchronous, non-pipelined basic topology."""
+        """Limit graph EP to supported non-pipelined topologies."""
         context = self._mesh_context
         if context is None or getattr(context, "ep_size", 1) <= 1:
             return
-        if any(
-            getattr(context, axis, 1) != 1 for axis in ("cp_size", "pp_size")
-        ):
-            raise ValueError("Graph EP currently requires CP=PP=1")
+        if getattr(context, "pp_size", 1) != 1:
+            raise ValueError("Graph EP currently requires PP=1")
         if self.pass_config.enable_overlap:
             raise ValueError("Graph EP currently requires enable_overlap=False")
 
