@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.checkpoint import build_checkpointer
+from hyper_parallel.compile.checkpoint import GraphCheckpointAdapter
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
     initialize_optimizer_state,
@@ -287,6 +288,14 @@ class CheckpointerCallback(Callback):
         }
         return {name: value for name, value in state_dict.items() if name in trainable}
 
+    def _graph_checkpoint_payload(self, payload: Dict[str, Any], *, restoring: bool = False) -> Dict[str, Any]:
+        """Describe graph-owned storage through DCP's existing tensor chunk interface."""
+        compiler = getattr(self.trainer, "graph_compiler", None)
+        if compiler is None:
+            return payload
+        adapter = GraphCheckpointAdapter(compiler)
+        return adapter.restore(payload) if restoring else adapter.prepare(payload)
+
     def _collect_extra_state(self, state: TrainerState) -> Dict[str, Any]:
         """Build the extra_state bundle (progress / scheduler / dataloader / RNG)."""
         # Prefer the iterator snapshot: with background prefetching the loader has
@@ -391,6 +400,7 @@ class CheckpointerCallback(Callback):
             )
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
+        checkpoint_state = self._graph_checkpoint_payload(checkpoint_state)
 
         external = get_model_external_state(self.trainer.model)
         if external is not None:
@@ -444,7 +454,14 @@ class CheckpointerCallback(Callback):
             hf_dir,
         )
 
-        write_assets = self._hf_checkpoint_manager.save_pretrained(hf_dir)
+        compiler = getattr(self.trainer, "graph_compiler", None)
+        if compiler is None:
+            write_assets = self._hf_checkpoint_manager.save_pretrained(hf_dir)
+        else:
+            full_state = GraphCheckpointAdapter(compiler).full_model_state(
+                keep=not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            )
+            write_assets = self._hf_checkpoint_manager.save_pretrained(hf_dir, state_dict=full_state)
         if write_assets:
             self._save_hf_assets(hf_dir)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -643,10 +660,10 @@ class CheckpointerCallback(Callback):
             checkpoint_state["optimizer"] = _unwrap_single(
                 [optimizer.state_dict() for optimizer in optimizers]
             )
-        return checkpoint_state, optimizers
+        return self._graph_checkpoint_payload(checkpoint_state), optimizers
 
     def _load_optimizer_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
-                                persisted_keys: Optional[frozenset[str]]) -> None:
+                                persisted_keys: Optional[frozenset[str]], checkpoint_id: Optional[str] = None) -> None:
         """Restore dense optimizer leaves or reload dense main parameters."""
         optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
         for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
@@ -654,6 +671,9 @@ class CheckpointerCallback(Callback):
             drop_primed = getattr(optimizer, "drop_unpersisted_dense_state", None)
             if drop_primed is not None and persisted_keys is not None:
                 drop_primed(persisted_keys)
+        compiler = getattr(self.trainer, "graph_compiler", None)
+        if compiler is not None and checkpoint_id is not None and optimizers:
+            GraphCheckpointAdapter(compiler).restore_optimizer_state(optimizers, checkpoint_id=checkpoint_id)
         if not optimizers:
             for optimizer in _as_list(self.trainer.optimizer):
                 if isinstance(optimizer, MixedPrecisionOptimizer):
@@ -663,6 +683,7 @@ class CheckpointerCallback(Callback):
                                 external: Any, runtime: Any, restore_path: str,
                                 load_plan: Any) -> None:
         """Install the loaded dense and external model, optimizer, and train state."""
+        checkpoint_state = self._graph_checkpoint_payload(checkpoint_state, restoring=True)
         if external is not None:
             full_model_keys = set(self.trainer.model.state_dict())
             dense_model_keys = set(checkpoint_state["model"])
@@ -680,7 +701,7 @@ class CheckpointerCallback(Callback):
             self.trainer.config.model_init_dtype,
         )
         persisted_keys = load_plan.persisted_optimizer_keys if load_plan is not None else None
-        self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys)
+        self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys, checkpoint_id=restore_path)
 
         if self._restore_train_state:
             self._apply_extra_state(checkpoint_state["extra_state"])
