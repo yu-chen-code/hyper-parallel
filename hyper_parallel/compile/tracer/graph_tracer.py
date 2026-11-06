@@ -74,7 +74,7 @@ from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
 
-from .dynamic_shapes import InputGuards, build_symbolic_inputs
+from .dynamic_shapes import InputGuards, ModelStateGuards, build_symbolic_inputs
 
 # Older torch's make_fx predates record_stack_traces / record_module_stack
 # and rejects unknown kwargs; forward only the kwargs this torch supports.
@@ -180,6 +180,7 @@ class JointGraph:
     state_fqns: List[str]
     example_inputs: tuple
     input_guards: InputGuards | None = None
+    state_guards: ModelStateGuards | None = None
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
@@ -647,10 +648,10 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         num_layers=num_layers,
         state_fqns=state_fqns,
         example_inputs=fake_args,
-        input_guards=(
-            InputGuards(user_inputs_flat, fake_args[num_state_inputs:], fake_mode.shape_env)
-            if symbolic else None
+        input_guards=InputGuards(
+            user_inputs_flat, fake_args[num_state_inputs:], fake_mode.shape_env if symbolic else None
         ),
+        state_guards=ModelStateGuards(model),
     )
 
 
@@ -686,6 +687,8 @@ def run_traced_graph(
             f"  Traced: {joint_graph.state_fqns}\n"
             f"  Got:    {list(model_state.keys())}"
         )
+    if joint_graph.state_guards is not None:
+        joint_graph.state_guards.validate(model)
 
     user_flat, user_spec = torch.utils._pytree.tree_flatten(inputs)
     traced_spec = getattr(joint_graph.graph_module, "user_inputs_spec", None)
