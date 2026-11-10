@@ -138,7 +138,7 @@ def _annotate_ag_spec(node: fx.Node, degree: int, params: dict) -> None:
     node.meta["fsdp_bucket_spec"] = {
         "input_shape": shape,
         "output_shape": (shape[0] * degree, *shape[1:]),
-        "dtype": param.dtype,
+        "dtype": node.meta.get("param_dtype", param.dtype),
         "device": str(param.device),
     }
 
@@ -166,6 +166,18 @@ def annotate_fsdp_bucket_specs(graph_module: fx.GraphModule, model: nn.Module) -
             _annotate_rs_spec(node, degree)
         else:
             _annotate_ag_spec(node, degree, params)
+
+
+def _cast_node(graph: fx.Graph, node: fx.Node, dtype: Optional[torch.dtype]) -> fx.Node:
+    """Insert a precision conversion while retaining fake dtype/shape metadata."""
+    value = node.meta.get("val")
+    if dtype is None or (value is not None and value.dtype == dtype):
+        return node
+    cast = graph.call_method("to", args=(node,), kwargs={"dtype": dtype})
+    cast.meta["autograd_backward"] = node.meta.get("autograd_backward", False)
+    if isinstance(value, FakeTensor):
+        cast.meta["val"] = value.to(dtype)
+    return cast
 
 
 def _free_tensor_storage(tensor: torch.Tensor) -> None:
@@ -336,6 +348,9 @@ class FSDPPass(GraphPass):
         self._gradient_reductions: Dict[str, GradientReduction] = {}
         self._source_gradient_groups: Dict[str, str] = {}
         self._parameter_groups: Dict[str, tuple[str, int]] = {}
+        self._storage_prepared = False
+        self._logical_parameter_shapes: Dict[str, tuple] = {}
+        self._parameter_dtypes: Dict[str, tuple] = {}
         # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
         # group/degree used by DDP / HSDP gradient reduction.
         self._dp_mode = "fsdp"
@@ -351,6 +366,29 @@ class FSDPPass(GraphPass):
         # ``_classify_dp_params`` and consumed by the all_gather / grad-reduce /
         # live-shard steps so they are pad-sharded like eager ``fully_shard``.
         self._padded_params: Dict[str, _PaddedParam] = {}
+
+    def prepare_model(self, pass_config: PassConfig, **kwargs: Any) -> frozenset[str]:
+        """Partition live storage using the same classification as graph lowering.
+
+        This metadata-only graph does not execute model code or collectives.
+        Call once before building optimizer parameters or loading a checkpoint.
+        """
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return frozenset()
+        model = self._setup_dp_config(pass_config, kwargs)
+        self._reset_run_state()
+        graph = fx.Graph()
+        parameters = list(model.named_parameters())
+        for index, _ in enumerate(parameters):
+            graph.placeholder(f"param_{index}")
+        graph.output(())
+        module = fx.GraphModule({}, graph)
+        names = [name for name, _ in parameters]
+        classification = self._classify_dp_params(module, names, len(names), [True] * len(names), model)
+        if self._dp_mode == "ddp":
+            return frozenset()
+        self._shard_live_model_params(model)
+        return frozenset(node.meta["param_name"] for node in classification.sharded_nodes)
 
     def run(
         self,
@@ -469,6 +507,9 @@ class FSDPPass(GraphPass):
         self._gradient_reductions = dict(kwargs.get("gradient_reductions", {}))
         self._source_gradient_groups = dict(kwargs.get("source_gradient_groups", {}))
         self._parameter_groups = dict(kwargs.get("parameter_groups", {}))
+        self._storage_prepared = kwargs.get("storage_prepared", False)
+        self._logical_parameter_shapes = kwargs.get("logical_parameter_shapes", {})
+        self._parameter_dtypes = kwargs.get("parameter_dtypes", {})
         if not self._expert_param_names.issubset(self._gradient_reductions):
             raise ValueError("Expert parameters require explicit gradient reduction policies")
         self._expert_fsdp_group_name = kwargs.get(
@@ -565,7 +606,8 @@ class FSDPPass(GraphPass):
             # index in the FSDP group). ``model.parameters()`` then yields the
             # shards, so the trainer's optimizer / grad accumulation stay
             # DP-agnostic; the graph re-gathers each step.
-            self._shard_live_model_params(model)
+            if not self._storage_prepared:
+                self._shard_live_model_params(model)
             annotate_fsdp_bucket_specs(graph_module, model)
 
         return graph_module
@@ -630,6 +672,9 @@ class FSDPPass(GraphPass):
             )
             if skip:
                 continue
+
+            if fqn in self._logical_parameter_shapes:
+                param = torch.empty(self._logical_parameter_shapes[fqn], dtype=param.dtype, device="meta")
 
             _, degree = self._param_group(fqn)
             if fqn in self._expert_param_names and degree == 1:
@@ -698,7 +743,9 @@ class FSDPPass(GraphPass):
         # Newly inserted collective nodes have no shape-propagated ``val``.
         value = param if param is not None else node.meta.get("val")
         if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
-            node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
+            dtype = self._parameter_dtypes.get(fqn, (value.dtype, None))[0]
+            element_size = torch.empty((), device="meta", dtype=dtype).element_size()
+            node.meta["fsdp_unsharded_nbytes"] = value.numel() * element_size
         self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
         return node
 
@@ -953,10 +1000,14 @@ class FSDPPass(GraphPass):
             # AllGather + immediate wait for correctness; FsdpOverlapPass may
             # sink the wait past independent compute later.
             with _insertion_point(graph, anchor, param_node):
+                dtype = self._parameter_dtypes.get(param_node.meta.get("param_name"), (None, None))[0]
+                gather_input = _cast_node(graph, param_node, dtype)
                 ag_node = graph.call_function(
                     _c10d_functional.all_gather_into_tensor,
-                    args=(param_node, degree, group_name),
+                    args=(gather_input, degree, group_name),
                 )
+                if dtype is not None:
+                    ag_node.meta["param_dtype"] = dtype
                 ag_node.meta["comm_type"] = "fsdp_all_gather"
                 ag_node.meta["comm_group"] = group_name
                 ag_node.meta["param_node"] = param_node.name
@@ -1005,7 +1056,14 @@ class FSDPPass(GraphPass):
                 replacement.meta["state_idx"] = param_node.meta.get("state_idx")
 
             for user in list(param_node.users.keys()):
-                if user not in (ag_node, wait_node):
+                if user in (gather_input, ag_node, wait_node):
+                    continue
+                if str(user.target) == "aten._to_copy.default" and user.kwargs == {"dtype": dtype}:
+                    # The shard was cast before gather; do not retain a second
+                    # full-size compute copy that defeats resharding.
+                    user.replace_all_uses_with(replacement)
+                    graph.erase_node(user)
+                else:
                     user.replace_input_with(param_node, replacement)
 
             self._processed_params.add(param_node.name)
@@ -1118,6 +1176,8 @@ class FSDPPass(GraphPass):
                 group_name, degree, self._gradient_reductions.get(fqn, _DEFAULT_GRADIENT_REDUCTION)
             )
             with graph.inserting_before(output_node):
+                dtype = self._parameter_dtypes.get(fqn, (None, None))[1]
+                grad_node = _cast_node(graph, grad_node, dtype)
                 new_returned[i] = self._build_grad_reduction_nodes(
                     graph,
                     grad_node,
@@ -1418,10 +1478,14 @@ class FSDPPass(GraphPass):
             record.param_node.meta.get("param_name", "")
         )
         with graph.inserting_before(anchor):
+            dtype = self._parameter_dtypes.get(record.param_node.meta.get("param_name"), (None, None))[0]
+            gather_input = _cast_node(graph, record.param_node, dtype)
             ag_node = graph.call_function(
                 _c10d_functional.all_gather_into_tensor,
-                args=(record.param_node, degree, group_name),
+                args=(gather_input, degree, group_name),
             )
+            if dtype is not None:
+                ag_node.meta["param_dtype"] = dtype
             ag_node.meta["comm_type"] = "fsdp_all_gather_backward"
             ag_node.meta["comm_group"] = group_name
             ag_node.meta["param_node"] = record.param_node.name
