@@ -48,6 +48,105 @@ class TestDynamicShapes(unittest.TestCase):
     def _compiler(self, **kwargs):
         return GraphCompiler(self.model, _loss, pass_config=self.config, **kwargs)
 
+    def test_static_inputs_reject_specialization_changes_before_execution(self):
+        """Static geometry and Python constants cannot silently replay stale branches."""
+        compiler = GraphCompiler(
+            self.model, lambda model, x, scale: model(x).sum() * scale, pass_config=self.config
+        )
+        compiler.forward_backward(x=torch.randn(3, 4), scale=2)
+        invalid = [
+            {"x": torch.randn(5, 4), "scale": 2},
+            {"x": torch.randn(4, 3).t(), "scale": 2},
+            {"x": torch.randn(4, 4)[1:], "scale": 2},
+            {"x": torch.randn(3, 4, dtype=torch.float64), "scale": 2},
+            {"x": torch.randn(3, 4), "scale": 3},
+        ]
+        with patch.object(compiler._joint_graph.graph_module, "forward") as execute:
+            for inputs in invalid:
+                with self.subTest(inputs=inputs), self.assertRaisesRegex(ValueError, "[Gg]raph input"):
+                    compiler.forward_backward(**inputs)
+            execute.assert_not_called()
+
+    def test_state_values_remain_live_but_structural_changes_are_rejected(self):
+        """Optimizer updates are valid; changed mode, identity and gradient contract are not."""
+        compiler = self._compiler()
+        x, y = torch.randn(3, 4), torch.randn(3, 3)
+        compiler.forward_backward(x=x, y=y)
+        with torch.no_grad():
+            self.model.weight.add_(0.1)
+        actual, _ = compiler.forward_backward(x=x, y=y)
+        torch.testing.assert_close(actual, _loss(self.model, x, y), rtol=0, atol=0)
+        for change in ("mode", "parameter", "requires_grad"):
+            with self.subTest(change=change):
+                model = copy.deepcopy(self.model)
+                case = GraphCompiler(model, _loss, pass_config=self.config)
+                case.forward_backward(x=x, y=y)
+                if change == "mode":
+                    model.eval()
+                elif change == "parameter":
+                    model.weight = torch.nn.Parameter(torch.clone(model.weight))
+                else:
+                    model.weight.requires_grad_(False)
+                with patch.object(case._joint_graph.graph_module, "forward") as execute:
+                    with self.assertRaisesRegex(ValueError, "Graph model state"):
+                        case.forward_backward(x=x, y=y)
+                    execute.assert_not_called()
+
+    def test_replacement_executable_preserves_runtime_metadata(self):
+        """A terminal pass may return a wrapper; its loss dictionary and gradients survive."""
+        class Executable(torch.nn.Module):
+            """Equivalent terminal backend wrapper without tracing metadata."""
+
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self.calls = 0
+
+            def forward(self, *args):
+                self.calls += 1
+                return self.inner(*args)
+
+        compiler = GraphCompiler(
+            self.model, lambda model, x, y: (_loss(model, x, y), {"main": _loss(model, x, y).detach()}),
+            pass_config=self.config,
+        )
+        with patch("hyper_parallel.compile.compiler.PassPipeline.run",
+                   side_effect=lambda graph, **kwargs: Executable(graph)):
+            x, y = torch.randn(3, 4), torch.randn(3, 3)
+            actual, losses = compiler.forward_backward(x=x, y=y)
+        self.assertEqual(compiler._joint_graph.graph_module.calls, 1)
+        torch.testing.assert_close(actual, losses["main"], rtol=0, atol=0)
+        expected = torch.autograd.grad(_loss(self.model, x, y), tuple(self.model.parameters()))
+        for parameter, gradient in zip(self.model.parameters(), expected):
+            torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
+
+    def test_module_and_state_kind_changes_invalidate_capture(self):
+        """Reusing a tensor does not preserve a changed module or parameter contract."""
+        class ShiftedLinear(torch.nn.Module):
+            """A distinct forward with the same parameter names and shapes."""
+
+            def __init__(self, weight):
+                super().__init__()
+                self.weight = weight
+
+            def forward(self, inputs):
+                return inputs @ self.weight.T + 1
+
+        model = torch.nn.Sequential(torch.nn.Linear(4, 3, bias=False))
+        compiler = GraphCompiler(model, _loss, pass_config=self.config)
+        inputs = {"x": torch.randn(3, 4), "y": torch.randn(3, 3)}
+        compiler.forward_backward(**inputs)
+        replacement = ShiftedLinear(model[0].weight)
+        model[0] = replacement
+        with self.assertRaisesRegex(ValueError, "Graph model state"):
+            compiler.forward_backward(**inputs)
+        compiler.compile(**inputs)
+        parameter = model[0].weight
+        delattr(model[0], "weight")
+        model[0].register_buffer("weight", parameter)
+        with self.assertRaisesRegex(ValueError, "Graph model state"):
+            compiler.forward_backward(**inputs)
+
     def _assert_step(self, compiler, batch, sequence):
         x = torch.randn(batch, sequence, 4)
         y = torch.randn(batch, sequence, 3)
@@ -225,12 +324,12 @@ class TestDynamicShapes(unittest.TestCase):
     def test_static_default_unchanged(self):
         """
         Feature: Symbolic graph shape contracts.
-        Description: Opting out retains concrete tensor metadata and no symbolic guards.
+        Description: Opting out retains concrete tensor metadata and static input guards.
         Expectation: Dynamic dimensions reuse graphs and static dimensions retain guards.
         """
         compiler = self._compiler()
         self._assert_step(compiler, 2, 5)
-        self.assertIsNone(compiler._joint_graph.input_guards)
+        self.assertIsNone(compiler._joint_graph.input_guards.shape_env)
         for dim in compiler._joint_graph.example_inputs[2].shape:
             self.assertIs(type(dim), int)
 

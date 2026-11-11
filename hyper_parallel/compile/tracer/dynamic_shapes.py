@@ -122,10 +122,11 @@ class InputGuards:
     No real input tensors or storage are retained here.
     """
 
-    def __init__(self, inputs: list[Any], fake_inputs: tuple[Any, ...], shape_env: ShapeEnv) -> None:
+    def __init__(self, inputs: list[Any], fake_inputs: tuple[Any, ...], shape_env: ShapeEnv | None) -> None:
         self.shape_env = shape_env
         self.fake_tensors = [value for value in fake_inputs if isinstance(value, torch.Tensor)]
         self.leaves = [self._metadata(value) for value in inputs]
+        self.static_geometry = None if shape_env is not None else self._geometry(inputs)
         self.aliases = self._aliases(inputs)
         self.expression = None
         self.refresh()
@@ -144,9 +145,18 @@ class InputGuards:
             for index, value in enumerate(inputs) if isinstance(value, torch.Tensor)
         ]
 
+    @staticmethod
+    def _geometry(inputs: list[Any]) -> list[tuple]:
+        return [
+            (tuple(value.shape), tuple(value.stride()) if value.layout == torch.strided else None,
+             value.storage_offset() if value.layout == torch.strided else None)
+            for value in inputs if isinstance(value, torch.Tensor)
+        ]
+
     def refresh(self) -> None:
         """Include constraints introduced by tracing and graph passes."""
-        self.expression = self.shape_env.produce_guards_expression(self.fake_tensors, ignore_static=False)
+        if self.shape_env is not None:
+            self.expression = self.shape_env.produce_guards_expression(self.fake_tensors, ignore_static=False)
 
     def validate(self, inputs: list[Any]) -> None:
         """Reject incompatible inputs before any graph or collective is executed."""
@@ -154,6 +164,8 @@ class InputGuards:
             raise ValueError("Graph input rank, dtype, device, layout, requires_grad or Python constant changed")
         if self._aliases(inputs) != self.aliases:
             raise ValueError("Graph input tensor aliasing changed since compilation")
+        if self.static_geometry is not None and self._geometry(inputs) != self.static_geometry:
+            raise ValueError("Static graph input shape/stride changed; compile again for the new inputs")
         tensors = [value for value in inputs if isinstance(value, torch.Tensor)]
         if self.expression and not self.shape_env.evaluate_guards_expression(self.expression, tensors):
             raise ValueError(
@@ -161,3 +173,37 @@ class InputGuards:
                 "related input sizes and shape-dependent branches. Compile with representative dynamic sizes > 1; "
                 "sizes 0/1 and Python shape branches may specialize the graph."
             )
+
+
+class ModelStateGuards:
+    """Guard graph-specialized module modes and storage metadata, allowing value updates."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.signature = self._signature(model)
+
+    @staticmethod
+    def _signature(model: torch.nn.Module) -> tuple:
+        """Snapshot module identities, state roles and storage geometry without retaining values."""
+        modes = tuple((name, id(module), type(module), module.training) for name, module in model.named_modules())
+        state = [
+            (kind, name, value)
+            for kind, entries in (("parameter", model.named_parameters(remove_duplicate=False)),
+                                  ("buffer", model.named_buffers(remove_duplicate=False)))
+            for name, value in entries
+        ]
+        tensors = tuple(
+            (kind, name, id(value), tuple(value.shape), value.dtype, value.device, value.layout, value.requires_grad,
+             tuple(value.stride()) if value.layout == torch.strided else None,
+             value.storage_offset() if value.layout == torch.strided else None)
+            for kind, name, value in state
+        )
+        return modes, tensors
+
+    def refresh(self, model: torch.nn.Module) -> None:
+        """Record the final storage contract after graph partitioning."""
+        self.signature = self._signature(model)
+
+    def validate(self, model: torch.nn.Module) -> None:
+        """Reject stale captures before running graph operators or collectives."""
+        if self._signature(model) != self.signature:
+            raise ValueError("Graph model state or training mode changed; compile again before execution")
