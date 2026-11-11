@@ -494,15 +494,9 @@ def _make_fwd_bwd_fn(
 
             grads = torch.autograd.grad(loss, params, allow_unused=True)
 
-        # Replace None grads with zeros so the output arity is stable.
-        processed_grads = []
-        for grad, param in zip(grads, params):
-            if grad is None:
-                processed_grads.append(torch.zeros_like(param))
-            else:
-                processed_grads.append(grad)
-
-        return [loss] + processed_grads + loss_dict_values
+        # None occupies its parameter's slot so optimizers can distinguish
+        # unused parameters from used parameters with a zero gradient.
+        return [loss] + list(grads) + loss_dict_values
 
     return _fwd_bwd_fn, loss_dict_keys_box
 
