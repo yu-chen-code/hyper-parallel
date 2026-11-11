@@ -60,6 +60,10 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("inductor_mode", "'off'"),
+                ("inductor_configs", "None"),
+                ("fsdp_bucketing", "False"),
+                ("fsdp_bucket_modules", "None"),
             ],
         )
 
@@ -107,6 +111,16 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+        for options in (
+            {"inductor_mode": "unknown"},
+            {"inductor_configs": {1: True}},
+            {"inductor_configs": {"max_autotune": True}},
+            {"fsdp_bucket_modules": "layers"},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                CompileConfig(**options)
+        with self.assertRaisesRegex(TypeError, "fsdp_bucketing"):
+            CompileConfig(fsdp_bucketing=1)
 
     def test_use_joint_graph_selects_graph_compiler(self):
         """Graph-mode trainer selection is driven by compile.enabled + flag."""

@@ -27,9 +27,8 @@ Covers the terminal TorchInductor compilation pass:
    itself; every per-stage forward/backward subgraph is compiled instead
    (both ``regional`` and ``full``), while unknown ``call_module`` stubs are
    still rejected.
-4. Guards: missing ``example_inputs``, mode canonicalization, pipeline
-   placement (terminal), and that inductor settings stay PassConfig-owned
-   (PP-style) instead of being projected from ``CompileConfig``.
+4. Guards: missing ``example_inputs``, mode canonicalization, terminal pipeline
+   placement and explicit joint backend options projected from ``CompileConfig``.
 """
 
 # The backend env var must be set before torch / hyper_parallel are imported,
@@ -54,6 +53,7 @@ from tests.ut.compile.inductor_stub import install_regional_inductor_stub
 install_regional_inductor_stub()
 
 from hyper_parallel.compile.compiler import GraphCompiler
+from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
 from hyper_parallel.compile.pass_config import (
     PassConfig,
     build_pass_config_from_trainer_config,
@@ -447,7 +447,7 @@ class TestInductorGuards(unittest.TestCase):
         self.assertEqual(joint.graph_module.meta.get("inductor_compiled"), "regional")
 
     def test_trainer_config_projection_strategy(self):
-        """Test inductor config is PassConfig-owned (PP-style), not projected."""
+        """Project explicit joint backend options without reusing decoder options."""
         trainer_config = SimpleNamespace(
             accelerator=SimpleNamespace(
                 tp_size=1, sequence_parallel=False, loss_parallel=False
@@ -458,13 +458,55 @@ class TestInductorGuards(unittest.TestCase):
             compile=SimpleNamespace(
                 inductor_mode="regional",
                 inductor_configs={"reorder_for_peak_memory": True},
+                fsdp_bucketing=True,
+                fsdp_bucket_modules=["layers.0", ["layers.1", "layers.2"]],
+                backend="decoder_backend",
+                options={"decoder_only": True},
             ),
         )
         config = build_pass_config_from_trainer_config(trainer_config)
-        # Like PP, inductor settings live on PassConfig only; the projected
-        # config keeps the defaults and ignores CompileConfig-level overrides.
-        self.assertEqual(config.inductor_mode, "off")
-        self.assertIsNone(config.inductor_configs)
+        self.assertEqual(config.inductor_mode, "regional")
+        self.assertEqual(config.inductor_configs, {"reorder_for_peak_memory": True})
+        self.assertTrue(config.fsdp_bucketing)
+        self.assertEqual(config.fsdp_bucket_modules, ["layers.0", ["layers.1", "layers.2"]])
+
+    def test_backend_retains_replacement_and_rejects_unavailable(self):
+        """Retain terminal wrappers and never report unavailable lowering as compiled."""
+        joint = self._traced()
+        wrapper = nn.Module()
+        wrapper.meta = {}
+        with mock.patch.object(InductorPass, "_compile_graph", return_value=wrapper):
+            result = InductorPass().run(
+                joint.graph_module, PassConfig(inductor_mode="full"), example_inputs=joint.example_inputs
+            )
+        self.assertIs(result, wrapper)
+        self.assertEqual(result.meta["inductor_compiled"], "full")
+        compiler = GraphCompiler(
+            _make_model(), _train_fn, pass_config=PassConfig(fsdp_enabled=False, inductor_mode="full")
+        )
+        with mock.patch("hyper_parallel.compile.passes.inductor_pass._regional_inductor_available",
+                        return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                x, y = _fixed_batch()
+                compiler.compile(x=x, y=y)
+        self.assertFalse(compiler.is_compiled)
+
+    def test_fsdp_placeholder_metadata_describes_runtime_storage(self):
+        """Backend shape propagation must not all-gather a full parameter a second time."""
+        model = nn.Linear(4, 5)
+        joint = trace_model_graph(model, _train_fn, {"x": torch.randn(2, 4), "y": torch.randn(2, 5)})
+        transport = mock.MagicMock()
+        transport.is_initialized.return_value = True
+        transport.get_world_size.return_value = 2
+        transport.get_rank.return_value = 1
+        with mock.patch("hyper_parallel.compile.passes.parallel.fsdp_pass.dist", transport), \
+             mock.patch("hyper_parallel.compile.passes.parallel.fsdp_pass._resolve_process_group"):
+            result = FSDPPass().run(joint.graph_module, PassConfig(fsdp_degree=2), model=model)
+        parameters = dict(model.named_parameters())
+        for node in result.graph.find_nodes(op="placeholder"):
+            name = node.meta.get("param_name")
+            if name in parameters:
+                self.assertEqual(tuple(node.meta["val"].shape), tuple(parameters[name].shape))
 
 
 if __name__ == "__main__":
