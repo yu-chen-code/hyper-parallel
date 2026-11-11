@@ -33,6 +33,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     ParamModuleInfo,
     ShardedState,
     apply_gradient_scaling_factor,
+    get_shard_geometry,
 )
 from hyper_parallel.core.fully_shard.utils import (
     CPUOffloadPolicy,
@@ -616,17 +617,12 @@ class HSDPParamV2:
             base_placements,
         )
 
-        chunks = torch.chunk(param_data, self.shard_world_size, dim=shard_dim)
-        if self.shard_rank < len(chunks):
-            local_shard = chunks[self.shard_rank]
-        else:
-            empty_slice = [slice(None)] * param_data.ndim
-            empty_slice[shard_dim] = slice(param_data.size(shard_dim), None)
-            local_shard = param_data[tuple(empty_slice)]
+        geometry = get_shard_geometry(param_data.shape, shard_dim, self.shard_world_size, self.shard_rank)
+        local_shard = param_data.narrow(shard_dim, geometry.start, geometry.local_shape[shard_dim])
         sharded_param = local_shard.clone().contiguous()
         self.sharded_size = sharded_param.size()
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
-        self.padded_sharded_param_size = chunks[0].size()
+        self.padded_sharded_param_size = geometry.padded_shape
         if self.offload_to_cpu and not sharded_param.is_meta:
             sharded_param = sharded_param.cpu()
             if self.pin_memory:

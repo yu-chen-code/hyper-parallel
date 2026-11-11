@@ -65,6 +65,8 @@ from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.node import _side_effectful_functions
 from torch.ops import _c10d_functional
 
+from hyper_parallel.core.fully_shard.hsdp_utils import get_shard_geometry
+
 from ...graph_parallel_plan import GraphParallelPlan
 from ...pass_config import GradientReduction, PassConfig, normalize_dp_mode
 from ..base import GraphPass
@@ -810,7 +812,7 @@ class FSDPPass(GraphPass):
             )
             return True
         n = int(shape[0])
-        n_pad = -(-n // degree) * degree
+        n_pad = get_shard_geometry(shape, 0, degree, 0).padded_shape[0] * degree
         self._padded_params[fqn] = _PaddedParam(
             n=n, n_pad=n_pad, dim0_pad=n_pad - n, ndim=param.ndim
         )
@@ -891,8 +893,8 @@ class FSDPPass(GraphPass):
 
             # Pad-shard a non-divisible param (recorded by
             # ``_classify_dp_params``): zero-pad dim 0 to a multiple of the
-            # degree, then take this rank's equal-size chunk — exactly what
-            # eager ``fully_shard`` does. A 0-dim scalar cannot be padded and
+            # degree, then retain this rank's padded communication shard.
+            # Eager retains only its valid rows. A 0-dim scalar cannot be padded and
             # stays replicated.
             pad_info = self._padded_params.get(name)
             if pad_info is not None:
@@ -903,7 +905,9 @@ class FSDPPass(GraphPass):
                         [full, full.new_zeros((pad_info.dim0_pad, *full.shape[1:]))],
                         dim=0,
                     )
-                param.data = full.chunk(degree, dim=0)[rank].clone()
+                geometry = get_shard_geometry(original_shape, 0, degree, rank)
+                shard_size = geometry.padded_shape[0]
+                param.data = full.narrow(0, rank * shard_size, shard_size).clone()
                 sharded_count += 1
                 _LOG.info(
                     "Pad-sharded %s: %s -> %s",
@@ -914,7 +918,8 @@ class FSDPPass(GraphPass):
                 continue
 
             original_shape = param.shape
-            param.data = param.detach().chunk(degree, dim=0)[rank].clone()
+            geometry = get_shard_geometry(original_shape, 0, degree, rank)
+            param.data = param.detach().narrow(0, geometry.start, geometry.local_shape[0]).clone()
             sharded_count += 1
             _LOG.info(
                 "Sharded %s: %s -> %s",
