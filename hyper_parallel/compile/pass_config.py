@@ -497,7 +497,7 @@ def build_pass_config_from_trainer_config(
     enable_overlap: bool = False,
     mesh_context: Optional[Any] = None,
 ) -> PassConfig:
-    """Project trainer topology intent onto graph-mode pass config.
+    """Project trainer topology and joint-backend intent onto graph-mode passes.
 
     This helper stays in the pass-config module because it computes the
     graph-pass surface from the trainer topology without altering runtime
@@ -578,6 +578,8 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        inductor_mode=getattr(compile_config, "inductor_mode", "off"),
+        inductor_configs=getattr(compile_config, "inductor_configs", None),
         ac_mode=ac_mode,
         ac_layer_count=ac_layer_count,
         ac_layer_indices=ac_layer_indices,

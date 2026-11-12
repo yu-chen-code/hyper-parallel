@@ -182,6 +182,13 @@ class GraphCompiler:
         return self._joint_graph is not None
 
     @property
+    def execution_backend(self) -> Optional[str]:
+        """Actual terminal backend, or None before the graph is ready."""
+        if self._joint_graph is None:
+            return None
+        return getattr(self._joint_graph.graph_module, "meta", {}).get("inductor_compiled", "fx")
+
+    @property
     def parameter_layouts(self) -> Optional[dict]:
         """Final parameter-identity layouts, available after storage preparation.
 
@@ -317,9 +324,17 @@ class GraphCompiler:
         if ac_scope is not None:
             pass_kwargs["ac_scope"] = ac_scope
 
-        # Passes mutate ``graph_module`` in place and return it, so the
-        # transformed graph lives on ``joint_graph`` for ``forward_backward``.
-        pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        # The terminal backend may return a wrapper around the transformed graph.
+        runtime_graph = pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        if getattr(runtime_graph, "meta", {}).get("inductor_compiled") == "unavailable":
+            raise RuntimeError("The requested joint-graph Inductor backend is unavailable in this torch build")
+        for name in (
+            "state_fqns", "state_is_param", "num_state_inputs", "user_inputs_spec",
+            "loss_dict_keys", "gradient_usage", "fsdp_sharded_param_names", "meta",
+        ):
+            if not hasattr(runtime_graph, name) and hasattr(joint_graph.graph_module, name):
+                setattr(runtime_graph, name, getattr(joint_graph.graph_module, name))
+        joint_graph.graph_module = runtime_graph
 
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()

@@ -123,6 +123,8 @@ class CompileConfig:
     ``max_in_flight_gb`` follows PyTorch's overlap scheduler naming and binary
     units; here it bounds early all-gather replicas until first use, per phase.
     Eager FSDP2 module prefetch depths do not configure these graph passes.
+    ``inductor_mode`` and ``inductor_configs`` select the terminal joint-graph
+    backend independently of decoder compilation; ``off`` executes FX directly.
     """
 
     enabled: bool = False
@@ -138,6 +140,9 @@ class CompileConfig:
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
+    # Joint-graph backend; backend/mode/options above configure decoder compilation.
+    inductor_mode: Literal["off", "regional", "full"] = "off"
+    inductor_configs: Optional[dict[str, Any]] = None
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -153,6 +158,7 @@ class CompileConfig:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
         self._validate_max_in_flight_gb()
+        self._validate_joint_graph_backend()
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -184,6 +190,18 @@ class CompileConfig:
             or value < 0
         ):
             raise ValueError("compile.max_in_flight_gb must be a finite non-negative number")
+
+    def _validate_joint_graph_backend(self) -> None:
+        """Validate the terminal backend independently of decoder options."""
+        if self.inductor_mode not in ("off", "regional", "full"):
+            raise ValueError("compile.inductor_mode must be 'off', 'regional' or 'full'")
+        if self.inductor_configs is not None and (
+            not isinstance(self.inductor_configs, dict)
+            or any(not isinstance(key, str) for key in self.inductor_configs)
+        ):
+            raise ValueError("compile.inductor_configs must be a mapping with string keys or None")
+        if self.inductor_configs and self.inductor_mode == "off":
+            raise ValueError("compile.inductor_configs requires an enabled compile.inductor_mode")
 
 
 @dataclass

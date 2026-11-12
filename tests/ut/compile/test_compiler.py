@@ -71,6 +71,45 @@ def _fixed_batch():
 class TestGraphCompilerForwardBackward(unittest.TestCase):
     """``compile`` / lazy ``forward_backward`` without distributed."""
 
+    def test_terminal_wrapper_preserves_training_metadata(self) -> None:
+        """Execute the returned module while preserving loss and gradient output layout."""
+        model = _make_model()
+        x, y = _fixed_batch()
+        expected_loss = _mse_train_fn(model, x=x, y=y)
+        expected_grads = torch.autograd.grad(expected_loss, tuple(model.parameters()))
+        compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False))
+        wrappers = []
+
+        class RuntimeWrapper(nn.Module):
+            """Mirror the backend's positional state-and-input calling convention."""
+
+            def __init__(self, inner):
+                """Keep the executable without its tracer metadata."""
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, *args):
+                """Forward every flat state and user input positionally."""
+                return self.inner(*args)
+
+        def wrap(graph_module, **_kwargs):
+            """Return a terminal executable without copying tracer metadata."""
+            wrappers.append(RuntimeWrapper(graph_module))
+            return wrappers[-1]
+
+        self.assertIsNone(compiler.execution_backend)
+        with patch("hyper_parallel.compile.compiler.PassPipeline.run", side_effect=wrap):
+            loss, _ = compiler.forward_backward(x=x, y=y)
+
+        self.assertIs(compiler._joint_graph.graph_module, wrappers[0])
+        self.assertEqual(compiler.execution_backend, "fx")
+        self.assertEqual(wrappers[0].num_state_inputs, len(tuple(model.parameters())))
+        self.assertEqual(wrappers[0].state_fqns, compiler._joint_graph.state_fqns)
+        self.assertEqual(wrappers[0].gradient_usage, (True, True))
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        for parameter, expected in zip(model.parameters(), expected_grads):
+            torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+
     def test_unit_bindings_reach_passes_with_tied_expert(self) -> None:
         """Claim nested experts before the root and keep every alias on EDP."""
         model = nn.Module()
