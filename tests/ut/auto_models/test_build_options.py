@@ -60,6 +60,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("inductor_mode", "'off'"),
+                ("inductor_configs", "None"),
             ],
         )
 
@@ -107,6 +109,19 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+
+    def test_joint_backend_validation(self):
+        """Reject malformed backend options and configurations disabled by their mode."""
+        cases = (
+            {"inductor_mode": "eager"},
+            {"inductor_mode": "full", "inductor_configs": ["debug"]},
+            {"inductor_mode": "full", "inductor_configs": {1: True}},
+            {"inductor_configs": {"debug": True}},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, "compile.inductor_"):
+                    CompileConfig(**options)
 
     def test_use_joint_graph_selects_graph_compiler(self):
         """Graph-mode trainer selection is driven by compile.enabled + flag."""
