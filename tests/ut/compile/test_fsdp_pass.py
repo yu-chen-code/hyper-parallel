@@ -515,6 +515,26 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
 
+    def test_shard_storage_preserves_padded_and_empty_tails(self):
+        """Every graph rank keeps uniform storage without changing parameter identity."""
+        degree = 4
+        for rows in (0, 2, 5):
+            source = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+            padded_rows = -(-rows // degree) * degree
+            padded = torch.cat((source, source.new_zeros(padded_rows - rows, 4)))
+            for rank in range(degree):
+                with self.subTest(rows=rows, rank=rank):
+                    model = _OddParam()
+                    model.odd = nn.Parameter(source.clone())
+                    param = model.odd
+                    gm = _odd_joint_graph()
+                    with _patch_dist(world_size=degree, rank=rank):
+                        FSDPPass().run(gm, PassConfig(fsdp_degree=degree), model=model)
+                    expected = padded.chunk(degree)[rank]
+                    self.assertIs(model.odd, param)
+                    torch.testing.assert_close(model.odd, expected, atol=0, rtol=0)
+                    gm.graph.lint()
+
     def test_configured_replica_preserves_storage_and_uses_all_reduce(self):
         """Explicit replicas bypass padding and gathers while retaining DP synchronization."""
         for mode in ("fsdp", "hsdp"):
