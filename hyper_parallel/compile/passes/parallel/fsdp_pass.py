@@ -480,6 +480,16 @@ class FSDPPass(GraphPass):
             len(param_nodes),
         )
 
+        # Backend propagation starts from physical shards, not captured logical weights.
+        parameters = dict(model.named_parameters())
+        for node in param_nodes:
+            value = node.meta.get("val")
+            parameter = parameters.get(node.meta["param_name"])
+            if isinstance(value, torch.Tensor) and parameter is not None:
+                node.meta["val"] = value.new_empty_strided(
+                    parameter.shape, parameter.stride(), requires_grad=value.requires_grad
+                )
+
         graph_module.recompile()
         return graph_module
 
